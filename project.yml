@@ -1,0 +1,55 @@
+name: Patrol
+
+options:
+  bundleIdPrefix: cn.lincao
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+targets:
+  Patrol:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Patrol
+        excludes:
+          - Info.plist
+          - Resources
+    resources:
+      - path: Patrol/Resources
+        type: folder
+    info:
+      path: Patrol/Info.plist
+      properties:
+        CFBundleDisplayName: 保护地巡护
+        CFBundleName: Patrol
+        CFBundleIdentifier: cn.lincao.patrol.ios
+        CFBundleVersion: "188"
+        CFBundleShortVersionString: "1.0.188"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UIBackgroundModes:
+          - location
+          - audio
+          - fetch
+          - processing
+        NSLocationWhenInUseUsageDescription: 用于在地图上显示您的位置、记录巡护航迹与采集点定位。
+        NSLocationAlwaysAndWhenInUseUsageDescription: 巡护需要在锁屏和后台持续记录航迹并每分钟上报位置，以便队友看到您的在线状态。
+        NSMicrophoneUsageDescription: 用于对讲机按住说话。
+        NSCameraUsageDescription: 用于现场拍照并在照片上叠加经纬度与时间水印。
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsArbitraryLoadsInWebContent: true
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      configs:
+        Debug:
+          SWIFT_VERSION: "5.0"
+          CODE_SIGNING_ALLOWED: "NO"
+          CODE_SIGNING_REQUIRED: "NO"
+        Release:
+          SWIFT_VERSION: "5.0"
+          CODE_SIGNING_ALLOWED: "NO"
+          CODE_SIGNING_REQUIRED: "NO"

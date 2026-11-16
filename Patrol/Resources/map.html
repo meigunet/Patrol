@@ -1,0 +1,1615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>巡护地图</title>
+  <link rel="stylesheet" href="./leaflet/leaflet.css" />
+  <style>
+    html, body { margin: 0; height: 100%; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    /* 注意：不使用 inset 简写（Chrome 87+ 才支持，旧版 WebView 上会导致元素尺寸为 0 → 地图全白） */
+    /* 指南针跟随模式下整体旋转地图（JS 设置 transform）；过渡让转向更顺 */
+    /* build114：用 100vh 兜底容器高度。
+       根因（build113 诊断实测）：任务页 WebView 视口是 383x344，但 Leaflet 容器
+       getSize() 报 383x0 —— html/body 的 height:100% 在早期布局时被算成 0，
+       之后 WebView 拿到真实尺寸也没有重算，于是绝对定位的 #map（top/bottom:0）
+       高度为 0：既不请求瓦片（tileload/tileerror 都不触发）也不报错，整片空白。
+       vh 直接以视口为基准，不依赖父级百分比高度，因此不受这个缺陷影响。 */
+    #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; height: 100vh; width: 100vw; background: #eef3ea; transition: transform .18s ease-out; }
+    #bar {
+      position: absolute; top: 8px; left: 8px; right: 8px; z-index: 1000;
+      background: rgba(20,80,30,0.94); color: #fff; font-size: 14px;
+      padding: 8px 12px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,.3);
+      display: flex; flex-wrap: wrap; align-items: center;
+    }
+    #bar span { margin-right: 14px; }
+    #bar b { font-weight: 700; font-size: 15px; }
+    #status { margin-left: auto; font-size: 12px; opacity: .95; }
+    .legend { background: rgba(255,255,255,.94); color:#222; padding:6px 10px; border-radius:8px; font-size:13px; position:absolute; top:64px; right:10px; z-index:1000; box-shadow:0 1px 5px rgba(0,0,0,.25); line-height:1.7; }
+    .dot { display:inline-block; width:11px; height:11px; border-radius:50%; margin-right:5px; vertical-align:middle; border:1px solid #fff; }
+    .leaflet-popup-content { font-size: 13px; line-height: 1.6; white-space: pre-line; }
+    .ctr-label { background: rgba(20,80,30,.9); color:#fff; border:none; box-shadow:none; font-size:12px; font-weight:600; padding:2px 6px; border-radius:4px; }
+    .ctr-label:before { border-top-color: rgba(20,80,30,.9); }
+    /* 图层标注文字（服务端「图层管理」配置的标注字段）：浅色底 + 图层色文字，地形底图上也干净可读 */
+    .layer-label {
+      background: rgba(255,255,255,.85); border: none; box-shadow: none; padding: 0 4px; margin: 0;
+      color: #1b3b1f; font-size: 11px; font-weight: 700; white-space: nowrap; border-radius: 3px;
+    }
+    .layer-label:before { display: none; }
+    /* build112：低缩放级别下隐藏图层常驻标注（如 352 个网格面的编号）——
+       缩小时几百个标注互相叠加成一团乱码，看起来像「网格和标注对不上」；
+       放大到 LABEL_ZOOM_MIN 以上才显示（与网页端 build107 的阈值策略一致） */
+    .labels-off .leaflet-tooltip.layer-label { display: none !important; }
+    /* 我的位置：蓝色箭头（指向正北，按设备朝向旋转）+ 白边描边，任何底图上都清晰 */
+    .me-arrow { position: absolute; inset: 0; transition: transform .18s linear; }
+    /* build120（按用户要求）：定位图标 = **实心圆点 + 圆外箭头**，箭头随指南针朝向旋转。
+       圆点固定表示"位置"，箭头表示"朝向"，两者分离更接近常见导航地图的习惯。 */
+    /* build138：按参考图重做定位图标——蓝色实心大点 + 白色描边 + 上方三角箭头；
+       外侧另画一个「精度圈」（灰色半透明，半径 = GPS 水平精度米数，精度越高圈越小）。
+       去掉 drop-shadow 滤镜：部分 WebView 下阴影会随定位刷新反复重绘，看着"一闪一闪"。 */
+    /* build166：定位点重绘 ——
+       ① 精度圈（浅灰填充 + 白色描边，尺寸由 GPS 精度决定）；
+       ② **白色圆底**（细描边 + 轻阴影）作为定位针的底座，浅色/深色底图都看得清；
+       ③ 白圆内的**蓝色导航箭头**随设备朝向旋转（完全落在圆内，不再像旧版那样拖着尾巴伸到圈外）。
+       旧版是「蓝圆点 + 圈外长尾巴箭头」，放大后像一根针，观感差。 */
+    /* build167（按用户要求）：定位图标**固定大小**，不再随 GPS 精度放大缩小；
+       尺寸只比采集点（16px 蓝点）大一点 → 24px。白底圆 + 蓝箭头整体 24×24。 */
+    /* build179：build178 的「缩到 20px + 白圆半透明」已撤回——
+       用户要的是「定位点盖在航迹之上」，不是让图标变小变透明。
+       现在恢复 24px 实心白圆，层级改为最高（mePane z=670，仍低于气泡层）。 */
+    .me-dot { position: relative; width: 24px; height: 24px; }
+    .me-head { position: absolute; inset: 0; transform-origin: 50% 50%; }
+    .me-badge {
+      position: absolute; left: 0; top: 0; width: 24px; height: 24px;
+      border-radius: 50%; background: #FFFFFF; box-sizing: border-box;
+      box-shadow: 0 1px 2px rgba(0,0,0,.32), 0 0 0 1px rgba(0,0,0,.06);
+    }
+    /* 精度圈已取消（build167）：原来尺寸随 GPS 精度在 34~86px 之间变，用户看着像"图标自己在放大缩小"。
+       现在只保留一个固定的白色圆底，位置精度不再影响图标大小。 */
+    /* 加载遮罩：高对比可读 */
+    #loading {
+      position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 2000; display: flex; align-items: center; justify-content: center;
+      background: rgba(232,242,228,.92); color: #14481e; font-size: 16px; font-weight: 600; flex-direction: column;
+    }
+    #loading .spin { width: 30px; height: 30px; border: 3px solid #b7d9b0; border-top-color: #2e7d32; border-radius: 50%; animation: sp 0.9s linear infinite; margin-bottom: 10px; }
+    @keyframes sp { to { transform: rotate(360deg); } }
+    /* 错误条：可读 */
+    #err {
+      position: absolute; top: 60px; left: 10px; right: 10px; z-index: 1500; display: none;
+      background: #b3261e; color: #fff; font-size: 13px; padding: 8px 12px; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.3); line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <span><b>美姑大风顶保护区</b></span>
+    <span>图层 <b id="c-layer">0</b></span>
+    <span>记录 <b id="c-rec">0</b></span>
+    <span>在线 <b id="c-on">0</b></span>
+    <span id="status">初始化…</span>
+  </div>
+  <div id="err"></div>
+  <div id="map"></div>
+  <div class="legend">
+    <div><span class="dot" style="background:#2563EB"></span>采集点</div>
+    <div><span class="dot" style="background:#16A34A"></span>在线人员</div>
+    <div><span class="dot" style="background:#9CA3AF"></span>离线人员</div>
+  </div>
+  <div id="loading"><div class="spin"></div><div>正在加载地图数据…</div></div>
+
+  <script src="./leaflet/leaflet.js"></script>
+  <script>
+    var q = new URLSearchParams(location.search);
+    var server = (q.get('server') || '').replace(/\/+$/, '');
+    if (!server) server = location.origin + '/api';
+    var serverRoot = server.replace(/\/api$/, '');
+    var token = q.get('token') || '';
+    // 宿主（App）自带顶栏时可传 chrome=0，隐藏本页顶部信息条，避免"顶部被两层标题盖住"
+    var chrome = q.get('chrome') !== '0';
+    // 底图按服务端 map-config 的 key 选择（satellite / online）
+    var basemap = q.get('basemap') || 'satellite';
+    var errEl = document.getElementById('err');
+    var statusEl = document.getElementById('status');
+    function setStatus(t) { statusEl.textContent = t; }
+    function showErr(t) {
+      // 401 = token 失效，给出可操作的提示（正常会被 App 的自动刷新兜住）
+      if (String(t).indexOf('401') >= 0) t = '登录已过期：请到「我的」页退出登录后重新登录';
+      errEl.textContent = t; errEl.style.display = 'block';
+    }
+    function hideErr() { errEl.style.display = 'none'; }
+    // 离线判定：无网络时数据接口必然失败，不应当成“接口异常”吓用户（离线切图也走这里）
+    function isOffline() { try { return navigator.onLine === false; } catch (e) { return false; } }
+    // fetch 真实拉不到网（即便 onLine 误报 true）会抛 TypeError / Failed to fetch，也按离线处理
+    function isNetworkError(e) {
+      if (!e) return false;
+      var s = ((e.name || '') + ' ' + (e.message || ''));
+      return /TypeError|Failed to fetch|NetworkError|Network request failed/i.test(s);
+    }
+    function dataErr(label, e) {
+      if (isOffline() || isNetworkError(e)) {
+        setStatus('离线，' + label + '数据不可用');
+        hideErr();
+      } else {
+        setStatus(label + '加载失败');
+        showErr(label + '接口异常：' + (e && e.message ? e.message : e));
+      }
+    }
+
+    function api(path) {
+      var url = serverRoot + '/api/' + path.replace(/^\//, '');
+      return fetch(url, { headers: token ? { 'Authorization': 'Bearer ' + token } : {} })
+        .then(function (r) { if (!r.ok) throw new Error(path + ' → HTTP ' + r.status); return r.json(); });
+    }
+    function api2(url) {
+      return fetch(url, { headers: token ? { 'Authorization': 'Bearer ' + token } : {} })
+        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .catch(function () { return null; });
+    }
+
+    var CENTER = [28.6673, 103.105];
+    // 支持从 URL 恢复视野（App 端在"清除不掉就重载页面"的兜底路径上会带上当前中心/缩放，
+    // 这样重载后用户看到的还是同一块地方，不会突然跳回全区）
+    var initView = null, initZoom = 11;
+    try {
+      var c = q.get('c');
+      if (c) {
+        var parts = c.split(',');
+        if (parts.length >= 2) {
+          var la = parseFloat(parts[0]), ln = parseFloat(parts[1]);
+          if (isFinite(la) && isFinite(ln)) initView = [la, ln];
+        }
+      }
+      var z = parseInt(q.get('z') || '', 10);
+      if (isFinite(z)) initZoom = z;
+    } catch (e) {}
+    // build134：**照搬 WEB 端的渲染方式**——矢量图层用 Canvas 渲染（preferCanvas:true）。
+    // WEB 端（MapPanel.vue）一直用 preferCanvas，从未出现"加图层变形"；
+    // 而 App 之前用 Leaflet 默认的 SVG 渲染：每个要素是一个 <path> DOM，
+    // 图层增删/尺寸变化时 rootGroup 的变换会残留，导致已有图层跟着变形/位移。
+    // Canvas 每次 _update 整体重绘，天然不会残留，这也是 WEB 端正常的根本原因。
+    var map = L.map('map', {
+      zoomControl: true,
+      // 右下角那条「Leaflet | © …」版权条按用户要求去掉（WEB 端 MapPanel 同步关闭）
+      attributionControl: false,
+      preferCanvas: true,
+      // build141：**彻底关闭缩放/淡入/标记动画**。
+      // 只关 markerZoomAnimation 不够——地图的 zoomAnimation 会在缩放过程中对标记施加
+      // 临时 scale（约 0.7x 等），于是圆点/三角"一会大一会小"、看着像在闪。
+      // 关掉后缩放直接切到新层级（瓦片瞬时重绘），标记永远保持固定像素大小。
+      zoomAnimation: false,
+      fadeAnimation: false,
+      markerZoomAnimation: false
+    }).setView(initView || CENTER, initZoom);
+    var scaleCtrl = L.control.scale({ imperial: false }).addTo(map);
+    // build131：图层增删后**强制按当前容器尺寸重绘**。
+    // 现场实测：同一视野下，多加载一个图层后，已有图层（蓝色网格）形状/位置才"跳"到正确形状——
+    // 说明首个图层绘制时渲染器用的还是旧尺寸（被压扁），直到下一次图层变动才重算。
+    // 这里在每次图层增删后重算地图尺寸并逐层 redraw，保证一开始就是正确比例。
+    function redrawVectors() {
+      var renderers = [];
+      try {
+        for (var id2 in layerGroups) {
+          var g = layerGroups[id2];
+          if (!g || !map.hasLayer(g)) continue;
+          if (g.eachLayer) g.eachLayer(function (ly) {
+            try { if (ly._renderer && renderers.indexOf(ly._renderer) < 0) renderers.push(ly._renderer); } catch (e) {}
+            try { if (ly.redraw) ly.redraw(); } catch (e) {}
+          });
+        }
+      } catch (e) {}
+      // Leaflet 的渲染器挂在每个 path 的 _renderer 上（map._renderer 并不存在），
+      // 必须拿到真实渲染器实例再 _update，才能把 rootGroup 的残留缩放松/位移复位。
+      renderers.forEach(function (r) { try { if (r._update) r._update(); } catch (e) {} });
+      // 兜底：触发一次 moveend，让所有渲染器按当前视野/尺寸重算。
+      try { map.fire('moveend'); } catch (e) {}
+    }
+    // build127：航迹线专用图层，zIndex 高于 markerPane(600)——避免橙色折线被采集点蓝点
+    // 整个压住，导致"只看到一堆点、看不到线"（用户反复反馈"航迹线没有"）。
+    try {
+      // build179（按用户要求）：**本人定位点专用 pane，z 最高（670，仍低于 popup 700）**——
+      // 记录航迹时橙色航迹线正好经过当前位置，定位图标必须压在航迹和采集点之上，
+      // 否则看不清自己现在在哪。（build178 曾把它放到最底层 580，方向搞反了，已撤回。）
+      map.createPane('mePane');
+      var meEl = map.getPane('mePane');
+      meEl.style.zIndex = 670;
+      meEl.style.pointerEvents = 'none';
+      map.createPane('tracePane');
+      var tpEl = map.getPane('tracePane');
+      tpEl.style.zIndex = 630;
+      tpEl.style.pointerEvents = 'none';
+      // build152：「起」「终」圆点要压在橙色航迹线之上（否则线正好从圆点中间穿过、把字压住）
+      map.createPane('traceTopPane');
+      var ttEl = map.getPane('traceTopPane');
+      ttEl.style.zIndex = 640;
+      ttEl.style.pointerEvents = 'none';
+      // build162（按用户要求）：**采集点要盖住航迹线**，不是线盖住点。
+      // 之前采集点用默认 markerPane（z=600），航迹线在 tracePane（z=630）之上，
+      // 一条粗线正好从蓝点中间穿过，把点压得看不清。这里单独给采集点一个更高的 pane。
+      // 注意：这个 pane 必须可点击（弹出「填写的表格名称」），不能设 pointerEvents:none。
+      map.createPane('recordPane');
+      var rpEl = map.getPane('recordPane');
+      rpEl.style.zIndex = 650;
+      rpEl.style.pointerEvents = 'auto';
+    } catch (e) {}
+
+    // 默认标记图标路径（相对本页，确保 assets 内图片可加载）
+    try {
+      L.Icon.Default.prototype.options.iconUrl = './leaflet/images/marker-icon.png';
+      L.Icon.Default.prototype.options.iconRetinaUrl = './leaflet/images/marker-icon-2x.png';
+      L.Icon.Default.prototype.options.shadowUrl = './leaflet/images/marker-shadow.png';
+    } catch (e) {}
+
+    // WebView 中地图容器常在 JS 初始化后才完成布局，需手动 invalidateSize，否则地图空白。
+    // 老版 WebView 布局视口高度可能为 0 且不随视图尺寸变化重新布局，这里用 JS 显式设定像素尺寸兜底。
+    var mapEl = document.getElementById('map');
+    function sizeMap() {
+      try {
+        // build114：优先取「较大的那个」——老 WebView 上 innerHeight 可能比实际可视区小
+        // （或早期为 0），documentElement.clientHeight 更贴近真实可视高度。
+        var sw = (window.screen && window.screen.width) ? window.screen.width : 0;
+        var sh = (window.screen && window.screen.height) ? window.screen.height : 0;
+        // build126：地图 div 必须**等于 WebView 可视区**，绝不能取物理屏幕尺寸。
+        // build124 用 screen 尺寸兜底，把任务页（地图卡片仅屏高 42%）的 #map 撑成
+        // 整屏高（412x915）——WebView 实际只有上面一小块可见，Leaflet 的视野中心、
+        // 瓦片请求范围全部错位，表现就是"点/线能画出来，但底图一张瓦片都不出"。
+        var w = Math.max(mapEl.clientWidth || 0, window.innerWidth || 0, document.documentElement.clientWidth || 0);
+        var h = Math.max(mapEl.clientHeight || 0, window.innerHeight || 0, document.documentElement.clientHeight || 0);
+        if (w < 60 && sw > 50) w = sw;   // 仅在视口确实拿不到时才用物理屏幕兜底
+        if (h < 60 && sh > 50) h = sh;
+        if (w > 50) mapEl.style.width = w + 'px';
+        if (h > 50) mapEl.style.height = h + 'px';
+      } catch (e) {}
+    }
+    function fixSize() {
+      sizeMap();
+      try { map.invalidateSize(); } catch (e) {}
+      // build126：尺寸就绪后补做延迟的 fitBounds（任务页没有 GPS 纠正视野，必须靠这里）
+      try {
+        if (pendingFit && !traceFitted) {
+          var all = pendingFit, sz = map.getSize();
+          if (sz && sz.x >= 60 && sz.y >= 60) {
+            pendingFit = null;
+            if (all.length === 1) map.setView(all[0], Math.max(map.getZoom() || 0, 15));
+            else map.fitBounds(L.latLngBounds(all), { padding: [40, 40] });
+            traceFitted = true;
+          }
+        }
+      } catch (e) {}
+    }
+    // 供 App 主动触发（页面就绪后 WebView 才真正拿到尺寸时用）
+    window.fixSizeNow = fixSize;
+    // build114：**自愈循环**——容器尺寸为 0 时持续重试（每 800ms），直到拿到真实高度。
+    // build113 的诊断证明：真正的问题不是"没有重试"，而是几次固定重试都发生在
+    // WebView 给出真实尺寸之前，之后再也不重试 → 容器永远 0 高、地图永远空白。
+    setInterval(function () {
+      try {
+        var s = map.getSize();
+        if (s.x < 60 || s.y < 60) fixSize();
+      } catch (e) {}
+    }, 800);
+    window.addEventListener('load', fixSize);
+    window.addEventListener('resize', fixSize);
+    setTimeout(fixSize, 200); setTimeout(fixSize, 600); setTimeout(fixSize, 1500); setTimeout(fixSize, 3000);
+    // 自诊断：容器尺寸异常时明示；多次重试 sizeMap，恢复后自动清除错误条
+    function checkSize() {
+      try {
+        var s = map.getSize();
+        if (s.x < 60 || s.y < 60) {
+          sizeMap(); map.invalidateSize();
+          s = map.getSize();
+        }
+        if (s.x < 60 || s.y < 60) {
+          showErr('地图容器尺寸异常：' + s.x + 'x' + s.y + '（视口 ' + window.innerWidth + 'x' + window.innerHeight + '）');
+        } else {
+          hideErr();
+        }
+      } catch (e) {}
+    }
+    setTimeout(checkSize, 1800); setTimeout(checkSize, 4000); setTimeout(checkSize, 8000);
+
+    // 顶部信息条：宿主已有顶栏时隐藏，并把图例上移到顶部
+    (function applyChrome() {
+      if (!chrome) {
+        var bar = document.getElementById('bar');
+        if (bar) bar.style.display = 'none';
+        var lg = document.querySelector('.legend');
+        if (lg) lg.style.top = '10px';
+        var e = document.getElementById('err');
+        if (e) e.style.top = '10px';
+      }
+    })();
+
+    // 离线经纬网格已按需求移除（不再绘制网格线）
+
+    // 在线瓦片：按服务端底图配置（basemap）选择。
+    // 内置底图：卫星影像（Esri World Imagery）+ 离线地图（不请求在线瓦片，只显示矢量图层与点位）。
+    // 街道/地形等统一走网页端「地图管理 → 在线地图 / WMTS」。
+    var TILES = {
+      // build123：用户要求换回卫星影像（Esri World Imagery），仍走服务器代拉。
+      satellite: { url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr: '© Esri World Imagery' }
+    };
+    // 当前底图的瓦片层：切底图时先移除旧的，避免多张瓦片叠在一起
+    var baseLayer = null;
+    // build162：瓦片重试的「代次号」，见 addBase 里的 _r 参数说明
+    var tileBust = 0;
+    function removeBase() {
+      if (baseLayer) { try { map.removeLayer(baseLayer); } catch (e) {} baseLayer = null; }
+    }
+    function addBase(url, opts) {
+      try {
+        var o = opts || { maxZoom: 18, opacity: 0.95 };
+        // build134：与 WEB 端一致，关闭瓦片淡入动画（避免缩放时残留半透明/错位）
+        o.fadeAnimation = false;
+        // build160：**限制原生瓦片层级**——用户反馈「放大缩小依旧不显示」。
+        // 高德卫星（style=6）只到 18 级，Leaflet 若继续向上要 19/20 级的瓦片，
+        // 服务器返回 404（tileerror），放大后就是一片空白。
+        // 设 maxNativeZoom=18 后，19/20 级用 18 级瓦片放大显示，放大永远有图。
+        // build163：WMTS 服务（四川省地理信息平台等）最高只到 17 级（矩阵 2..17），
+        // 18 级起上游 404 → 高倍放大又是一片空白；这类地址按 17 级封顶（再放大用 17 级瓦片拉伸）。
+        if (!(o.maxNativeZoom > 0)) {
+          o.maxNativeZoom = /tilematrix=|SERVICE=WMTS/i.test(String(url)) ? 17 : 18;
+        }
+        if (!(o.minZoom > 0)) o.minZoom = 3;
+        // Leaflet 的 {s} 多子域占位（MapLibre 模板不带 {s}，这里兜底）
+        if (url.indexOf('{s}') >= 0 && !o.subdomains) o.subdomains = ['0', '1', '2', '3'];
+        // build162：重试用「换 URL」而不是「重发同一 URL」。
+        // 现场症状是瓦片请求**挂起**（既不 onload 也不 onerror）：这种请求在渲染进程里一直排着，
+        // 用同一个 URL 重绘会被并到那条死请求上（这也是 build161 里 App 代取成功后
+        // 「已缓存 7914B」却仍然 ok:0 的原因）。加一个服务端会忽略的 _r 参数，
+        // 浏览器就必须发一条**全新**请求，拦截器里按「去掉 _r」的键命中本地缓存 → 立刻出图。
+        var finalUrl = url;
+        if (tileBust > 0) {
+          finalUrl = finalUrl.replace(/([?&])_r=\d+/g, '$1').replace(/[?&]$/, '');
+          finalUrl += (finalUrl.indexOf('?') >= 0 ? '&' : '?') + '_r=' + tileBust;
+        }
+        baseLayer = L.tileLayer(finalUrl, o).addTo(map);
+        curBaseUrl = url;   // 模板不带 _r，供换源/重试复用
+        tilesOk = 0; tilesErr = 0;
+        try {
+          baseLayer.on('tileload', function () { tilesOk++; });
+          baseLayer.on('tileerror', function () { tilesErr++; });
+        } catch (e) {}
+        // build124：瓦片层加进去后立刻让 Leaflet 重算容器尺寸并刷新瓦片。
+        // 很多「就绪但一张瓦片都不出」都是因为 addTo 时地图尺寸还是 0/异常，
+        // Leaflet 据此认为「可视范围为空」于是不发任何瓦片请求（ok:0/err:0）。
+        try { map.invalidateSize(); } catch (e) {}
+        startBaseMonitor();   // build161：体检定时器只启动一次，不再被底图重建打断
+      } catch (e) { baseLayer = null; }
+    }
+    /** 填充占位符（大小写不敏感）；WMTS 的 {TileMatrix}/{TileCol}/{TileRow} 转成 Leaflet 的 {z}/{x}/{y} */
+    function fill(url, token, value) {
+      return url.replace(new RegExp('\\{' + token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\}', 'gi'), value);
+    }
+    function onlineTile(online) {
+      var url0 = String((online && online.url) || '').trim();
+      if (!url0) return null;
+      var subs = String(online.subdomains || '').split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s !== ''; });
+      var url = url0;
+      url = fill(url, 'key', encodeURIComponent(online.key || ''));
+      url = fill(url, 'layer', encodeURIComponent(online.layer || ''));
+      url = fill(url, 'style', encodeURIComponent(online.style || 'default'));
+      url = fill(url, 'tileMatrixSet', encodeURIComponent(online.tileMatrixSet || ''));
+      url = fill(url, 'format', encodeURIComponent(online.format || 'image/png'));
+      // WMTS 标准占位 → Leaflet 占位（{tileMatrixSet} 已在上一步替换，不会被误伤）
+      url = fill(url, 'TileMatrix', '{z}');
+      url = fill(url, 'TileCol', '{x}');
+      url = fill(url, 'TileRow', '{y}');
+      var opts = { maxZoom: Number(online.maxZoom) || 18, attribution: online.attribution || '', opacity: 0.95 };
+      if (url.indexOf('{s}') >= 0) opts.subdomains = subs.length ? subs : ['0'];
+      return { url: url, opts: opts };
+    }
+    /**
+     * 应用底图：先移除旧瓦片层，再加载新的。
+     * 关键：切底图**只换瓦片层**，绝不整页重载——旧实现切底图会让 App reload 整个页面，
+     * 重载时图层 GeoJSON 请求一旦失败就被静默丢弃，表现为「切完底图图层没了」，
+     * 而且视野会被重置回默认位置。现在矢量图层、采集点、人员点都原地保留。
+     */
+    // 当前底图的标识（name|url）：App 就绪后会补发一次 setBasemap，与当前一致时直接跳过，
+    // 避免重复移除/重建瓦片层造成闪一下
+    var curBaseKey = null;
+    function applyBasemap(name, url) {
+      curBaseKey = String(name || '') + '|' + String(url || '');
+      removeBase();
+      var container = map.getContainer();
+      // build113：底图容器底色**不要清成空**（空 = 透出白色，看起来就是"地图白屏"）。
+      // 保持浅绿兜底色：瓦片没出来时至少能一眼看出"是没瓦片"而不是"整个控件坏了"。
+      if (container) container.style.background = '#eef3ea';
+      var u = String(url || '').trim();
+      if (u) { addBase(u, { maxZoom: 20, opacity: 0.95 }); return; }
+      if (name === 'offline') {
+        // 离线地图：不加在线瓦片，仅保留底色 + 已配置的矢量图层/点位（无网也能用）
+        if (container) container.style.background = '#eef3ea';
+        return;
+      }
+      if (name === 'online') {
+        api('map-config').then(function (cfg) {
+          var t = cfg && cfg.online && cfg.online.enabled ? onlineTile(cfg.online) : null;
+          if (t) addBase(t.url, t.opts);
+          else addBase(TILES.satellite.url, { maxZoom: 18, attribution: TILES.satellite.attr, opacity: 0.9 });
+        }).catch(function () {
+          addBase(TILES.satellite.url, { maxZoom: 18, attribution: TILES.satellite.attr, opacity: 0.9 });
+        });
+        return;
+      }
+      var bm = TILES[name] || TILES.satellite;
+      if (bm) addBase(bm.url, { maxZoom: 18, attribution: bm.attr, opacity: 0.9 });
+    }
+
+    // build111：瓦片出图自检 + 主备互切兜底。
+    // 症状背景：内置「卫星地图」指向 arcgisonline，这段链路在某些网络（国内访问境外
+    // 瓦片源）取不到任何瓦片，页面就停在背景色上且**毫无提示**——过去数个版本的
+    // 「地图不显示」都静默卡在这里，开发者与用户都无从判断。
+    // 现在：加载后 5 秒若一张瓦片都没出且报错 ≥4 次，自动切到另一条链路
+    //（服务端代拉 ⇄ 直连，覆盖"服务器侧不通"与"手机侧不通"两种失败）；仍失败才
+    // 明示错误条并给出可执行的建议，彻底消灭"静默空白"。
+    var tilesOk = 0, tilesErr = 0, curBaseUrl = null, baseAltTried = false, baseAltCount = 0;
+    var baseWatch = null;
+    /** 兼容保留（外部若还有调用）：真正的体检已改为不可被"重置"的定时器，见 startBaseMonitor */
+    function armBaseWatch(ms) { startBaseMonitor(); }
+    /**
+     * 备选链路（双向）：
+     *  - 当前走服务器中转（/api/tiles/proxy）→ 回退「直连上游」（服务器取不到时手机自己取）；
+     *  - 当前是直连上游 → 换「服务器中转」（手机取不到外部瓦片时的主用链路）。
+     * build160：App 端已把页面瓦片默认改为服务器中转（手机直连高德/Esri 会挂起：
+     * imgs>0 但 ok:0/err:0），这里保留反向回退，两条链路都失败才报错。
+     */
+    function altBaseUrl(u) {
+      try {
+        var tag = '/api/tiles/proxy?u=';
+        var i = u.indexOf(tag);
+        if (i >= 0) {
+          // 中转地址 → 取出上游直连地址（u 里的 & 已编码成 %26，按 & 切不会截断）
+          var direct = decodeURIComponent(u.substring(i + tag.length).split('&')[0]);
+          if (direct.indexOf('{z}') >= 0) return direct;
+          return null;
+        }
+        var s = String(q.get('server') || '');
+        if (s.indexOf('/api') > 0) {
+          var root = s.substring(0, s.indexOf('/api') + 4).replace(/\/api$/, '');
+          return root + '/api/tiles/proxy?u=' + encodeURIComponent(u) + '&z={z}&x={x}&y={y}';
+        }
+      } catch (e) {}
+      return null;
+    }
+    var baseChecks = 0;
+    function checkBaseTiles() {
+      try {
+        if (tilesOk > 0) { hideErr(); return; }
+        baseChecks++;
+        probeTile();
+        if (baseAltCount < 4) {
+          baseAltCount++;
+          baseAltTried = true;
+          var alt = curBaseUrl ? altBaseUrl(curBaseUrl) : null;
+          if (alt && alt !== curBaseUrl) { applyBasemap(basemap, alt); return; }
+        }
+        if (tilesErr > 0 || baseChecks >= 3) {
+          showErr('底图瓦片加载失败（服务器中转和直连都没有出图，报错 ' + tilesErr + ' 个）。' +
+            '请检查服务器能否访问外网；或在「地图管理 → 底图配置」把离线地图包设为默认底图（本机出图，断网也能看）。');
+        } else {
+          armBaseWatch();   // 网络慢的情况再给一轮机会
+        }
+      } catch (e) {}
+    }
+
+    /**
+     * build161：**不可被重置的底图体检定时器**。
+     *
+     * 之前用 `addBase()` 里 `clearTimeout + setTimeout` 的一次性看门狗，
+     * 只要底图在启动阶段被重建（App 的 mapConfig 异步到达后会补发一次 setBasemap、
+     * 取景 fitBounds 触发 zoomend 等）定时器就被不断重置，`checkBaseTiles` 永远轮不到执行——
+     * 现场诊断表现为 `alt:false`、`net:""`、`ok:0` 一直不变，兜底形同不存在。
+     * 改成**进程内唯一的 setInterval**：只启动一次，谁也无法取消；
+     * 每 4 秒体检一次，最多换 4 次链路，仍不出图才报错。
+     */
+    var baseTicks = 0, baseAttempts = 0, failNotified = false;
+    function startBaseMonitor() {
+      if (window.__baseMonitor) return;
+      window.__baseMonitor = setInterval(function () {
+        try {
+          baseTicks++;
+          if (!curBaseUrl && !baseLayer) return;              // 还没底图（离线底图模式）
+          if (tilesOk > 0) { if (baseTicks % 8 === 0) hideErr(); return; }
+          if (baseTicks % 4 !== 0) return;                    // 每 4 秒体检一次
+          probeTile();
+          if (baseAttempts < 4) {
+            baseAttempts++;
+            baseAltTried = true;
+            var alt = curBaseUrl ? altBaseUrl(curBaseUrl) : null;
+            if (alt && alt !== curBaseUrl) { applyBasemap(basemap, alt); return; }
+          }
+          // 4 次都不出图：明示错误，并请宿主 App 用**自己的网络栈**代取一张瓦片写进本地缓存
+          //（WebView 自身网络挂起时这是唯一的活路；取到后 App 会调 retryTiles 重发请求）
+          showErr('底图瓦片加载失败（服务器中转和直连都没出图，' + tilesErr + ' 个报错）。' +
+            '若持续如此，请在「地图管理 → 底图配置」改用离线地图包（本机出图，断网也能看）。');
+          if (!failNotified) {
+            failNotified = true;
+            askHostForTiles();
+          }
+        } catch (e) {}
+      }, 1000);
+    }
+    // 缩放重试：换层级后重新给一轮预算（用户反馈"放大缩小依旧不显示"）
+    map.on('zoomend', function () {
+      if (tilesOk > 0) return;
+      baseAttempts = 0; baseChecks = 0; failNotified = false;
+    });
+    /** 供 App 调用：宿主代取瓦片入库后，让页面用**新 URL**重发一次请求（命中本地缓存即可出图） */
+    window.retryTiles = function () {
+      try {
+        baseAttempts = 0; baseChecks = 0; failNotified = false;
+        tileBust = Date.now();
+        if (curBaseUrl) applyBasemap(basemap, curBaseUrl);   // 换 URL 重建，见 addBase 的 _r 说明
+        else if (baseLayer) { try { baseLayer.redraw(); } catch (e) {} }
+      } catch (e) {}
+      return tilesOk;
+    };
+    /**
+     * 供 App 调用：当前视野需要用到的瓦片地址（最多 12 张，不含 _r 参数）。
+     * App 用**自己的网络栈**把这批瓦片下好写进本地缓存，再调 retryTiles()，
+     * 页面重发请求时由 shouldInterceptRequest 直接命中缓存出图 —— 完全不依赖 WebView 的网络。
+     */
+    window.tileUrls = function () {
+      var out = [];
+      try {
+        if (!curBaseUrl) return out;
+        var z = Math.round(map.getZoom());
+        var b = map.getBounds();
+        var n = Math.pow(2, z);
+        function tx(lng) { return Math.floor((lng + 180) / 360 * n); }
+        function ty(lat) {
+          var r = lat * Math.PI / 180;
+          return Math.floor((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * n);
+        }
+        var x0 = Math.max(0, tx(b.getWest())), x1 = Math.min(n - 1, tx(b.getEast()));
+        var y0 = Math.max(0, ty(b.getNorth())), y1 = Math.min(n - 1, ty(b.getSouth()));
+        var tpl = String(curBaseUrl).replace(/([?&])_r=\d+/g, '$1').replace(/[?&]$/, '');
+        for (var y = y0; y <= y1 && out.length < 12; y++) {
+          for (var x = x0; x <= x1 && out.length < 12; x++) {
+            out.push(tpl
+              .replace(/\{-y\}/g, String(n - 1 - y))
+              .replace(/\{z\}/g, z).replace(/\{x\}/g, x).replace(/\{y\}/g, y)
+              .replace(/\{s\}/g, '0'));
+          }
+        }
+      } catch (e) {}
+      return out;
+    };
+    /** 把「当前视野缺哪几张瓦片」一次性交给 App 代取（比单张更彻底：一屏都能命中缓存） */
+    function askHostForTiles() {
+      try {
+        if (!window.Android || !Android.tilesNeeded) {
+          // 旧包没有批量接口时退回单张
+          var im = document.querySelector('.leaflet-tile');
+          if (im && im.src && window.Android && Android.tileProblem) Android.tileProblem(String(im.src));
+          return false;
+        }
+        var list = window.tileUrls();
+        if (!list.length) return false;
+        Android.tilesNeeded(JSON.stringify(list));
+        return true;
+      } catch (e) { return false; }
+    }
+    /** 供 App 诊断：当前底图的出图情况（build161：**关键字段放最前面**，App 只截前 230 字） */
+    window.tileDiag = function () {
+      var s = (function(){try{var z=map.getSize();return z.x+'x'+z.y;}catch(e){return '0x0';}})();
+      // imgs=0 → Leaflet 根本没建瓦片（视野/尺寸问题）；imgs>0 且 ok/err 都为 0 → 请求发出但挂起。
+      // srv/tile 是两个独立探测：srv=服务器接口可达性，tile=一张真实瓦片的加载结果。
+      var nTiles = 0, firstSrc = '', zz = 0;
+      try { var ts = document.querySelectorAll('.leaflet-tile'); nTiles = ts.length; if (nTiles) firstSrc = ts[0].src || ''; } catch (e) {}
+      try { zz = map.getZoom(); } catch (e) {}
+      return {
+        ok: tilesOk, err: tilesErr, imgs: nTiles,
+        srv: srvProbe, tile: tileProbe, alt: baseAltTried, att: baseAttempts,
+        size: s, z: zz, net: netProbe, tr: lastTraceInfo,
+        url: curBaseUrl, src: firstSrc, js: (window.__jsErr || '')
+      };
+    };
+
+    // build120：捕获页面内未处理的脚本异常并显示出来。
+    // 任务页出现过"地图框里什么都没有"（连航迹和采集点都不画）——没有错误信息完全无法定位，
+    // 这段把异常立刻写进 #err 条与诊断字段。
+    window.__jsErr = '';
+    window.onerror = function (msg, src, line, col) {
+      window.__jsErr = String(msg) + ' @' + line + ':' + col;
+      try { showErr('页面脚本异常：' + window.__jsErr); } catch (e) {}
+      return false;
+    };
+
+    // build115：网络探测——瓦片零出图时用一次带 3 秒超时的 fetch 取真实原因
+    // （超时 / DNS / 连接被拒 / HTTP 状态码 / CORS）。瓦片是 <img> 加载，不受 CORS 限制，
+    // 所以这里的 CORS 失败不代表瓦片一定失败，但"超时/连接被拒"能直接指向网络层。
+    var netProbe = '';
+    function probeTile() {
+      try {
+        if (!curBaseUrl) return;
+        var u = String(curBaseUrl)
+          .replace('{z}', String(map.getZoom()))
+          .replace('{x}', '0').replace('{y}', '0');
+        var ctl = window.AbortController ? new AbortController() : null;
+        var t = setTimeout(function () { try { if (ctl) ctl.abort(); } catch (e) {} }, 3000);
+        fetch(u, ctl ? { signal: ctl.signal } : {}).then(function (r) {
+          clearTimeout(t);
+          netProbe = 'HTTP' + r.status;
+        })['catch'](function (e) {
+          clearTimeout(t);
+          netProbe = '失败:' + ((e && (e.name || e.message)) || '?');
+        });
+      } catch (e) { netProbe = '探测异常'; }
+    }
+    /** 供 App 诊断：地图容器与视口尺寸（排查"容器 0 高导致整页白"的关键数据） */
+    window.mapDiag = function () {
+      try {
+        var s = map.getSize();
+        return { w: s.x, h: s.y, iw: window.innerWidth, ih: window.innerHeight };
+      } catch (e) { return null; }
+    };
+
+    // build112：图层常驻标注随缩放显隐。网格面等要素多、面小的图层，常驻标注在
+    // 低缩放级别下全部叠在一起（远看就是"标注和网格对不上"），放大才有可读性。
+    var LABEL_ZOOM_MIN = 13;
+    function applyLabelZoom() {
+      try {
+        var on = map.getZoom() >= LABEL_ZOOM_MIN;
+        var c = map.getContainer();
+        if (c) { if (on) c.classList.remove('labels-off'); else c.classList.add('labels-off'); }
+      } catch (e) {}
+    }
+    map.on('zoomend', applyLabelZoom);
+    applyLabelZoom();
+    /** 供 App 调用：手工重切一次备选链路（排障用） */
+    window.toggleBaseSource = function () {
+      try {
+        var alt = curBaseUrl ? altBaseUrl(curBaseUrl) : null;
+        if (alt) { applyBasemap(basemap, alt); return alt; }
+      } catch (e) {}
+      return '';
+    };
+    /** 供 App 调用：运行时切换底图（同一页面内完成，不重载、不丢图层与视野） */
+    window.setBasemap = function (name, url) {
+      var nm = name || basemap || 'satellite';
+      var u = String(url || '');
+      // 与当前底图一致 → 什么都不做（App 页面就绪时会补发一次，避免无谓重建导致闪烁）
+      if (curBaseKey === (String(nm) + '|' + u)) return true;
+      basemap = nm;
+      applyBasemap(nm, u);
+      return true;
+    };
+    // 瓦片模板参数（tileUrl）：App 端按「底图配置」选中的那条解析好直接传入
+    //（在线地图 = 填好 KEY 的 XYZ/WMTS 模板；离线地图包 = 服务端 MBTiles 出瓦片地址）。
+    // 有 tileUrl 时优先生效；否则回退 basemap 内置逻辑（satellite / online / offline）。
+    var tileUrlParam = (q.get('tileUrl') || '').trim();
+    applyBasemap(basemap, tileUrlParam);
+    startBaseMonitor();
+
+    // ===== build161：两条链路的独立探测（诊断用，结果直接进诊断行）=====
+    // 现场出现过「数据接口正常、瓦片 <img> 却永远挂起」的情况，只靠 ok/err 分辨不出来，
+    // 所以分别探测：① 服务器 JSON 接口能不能通（fetch，受 CORS 影响）；
+    // ② 一张真实瓦片能不能加载（img，不受 CORS 影响，和 Leaflet 的加载方式完全一致）。
+    // 两个结果组合就能定位到底断在哪一跳。
+    var srvProbe = '', tileProbe = '';
+    (function () {
+      try {
+        var s0 = String(q.get('server') || '').replace(/\/+$/, '');
+        if (!s0) { srvProbe = '无'; return; }
+        fetch(s0 + '/app/version', { cache: 'no-store' }).then(function (r) {
+          srvProbe = 'HTTP' + r.status;
+        })['catch'](function (e) {
+          srvProbe = '失败:' + ((e && (e.name || e.message)) || '?');
+        });
+        setTimeout(function () { if (!srvProbe) srvProbe = '超时'; }, 9000);
+      } catch (e) { srvProbe = '异常'; }
+    })();
+    function probeTileImage(u) {
+      try {
+        tileProbe = '等待';
+        var done = false;
+        var im = new Image();
+        var t = setTimeout(function () { if (!done) { done = true; tileProbe = '超时'; } }, 8000);
+        im.onload = function () {
+          if (done) return; done = true; clearTimeout(t);
+          tileProbe = 'ok' + (im.naturalWidth ? im.naturalWidth + 'x' + im.naturalHeight : '');
+        };
+        im.onerror = function () { if (done) return; done = true; clearTimeout(t); tileProbe = 'error'; };
+        im.src = u;
+      } catch (e) { tileProbe = '异常'; }
+    }
+    function probeFirstTile() {
+      try {
+        if (!curBaseUrl) return;
+        var z = map.getZoom(), c = map.getCenter();
+        var n = Math.pow(2, z);
+        var tx = Math.floor((c.lng + 180) / 360 * n);
+        var lat = c.lat * Math.PI / 180;
+        var ty = Math.floor((1 - Math.log(Math.tan(lat) + 1 / Math.cos(lat)) / Math.PI) / 2 * n);
+        var u = String(curBaseUrl)
+          .replace(/\{-y\}/g, String(n - 1 - ty))
+          .replace(/\{z\}/g, z).replace(/\{x\}/g, tx).replace(/\{y\}/g, ty);
+        probeTileImage(u);
+      } catch (e) { tileProbe = '异常'; }
+    }
+    setTimeout(probeFirstTile, 2500);
+    setTimeout(function () { if (tilesOk === 0) probeFirstTile(); }, 9000);
+
+    // 注：原「保护区中心标记」（一个常驻的橙色大圆点 + 永久文字标签）已移除。
+    // 它和测量取点同色（#E65100），一直被误认为"测量点清不掉"；且用户不要地图上出现保护区名字。
+
+    function popupHtml(title, lines) {
+      return '<b>' + title + '</b>' + (lines ? '\n' + lines : '');
+    }
+
+    // 统一在全部请求结束后隐藏加载遮罩
+    var pending = 4, done = 0;
+    function tick() { done++; if (done >= pending) { var l = document.getElementById('loading'); if (l) l.style.display = 'none'; fixSize(); } }
+    // 兜底：fetch 没有超时，服务器不响应时遮罩会永远盖在地图上（z-index 2000 全屏），
+    // 用户点地图全部被它吃掉。最多 8 秒，无论如何收起遮罩。
+    setTimeout(function () {
+      var l = document.getElementById('loading');
+      if (l && l.style.display !== 'none') { l.style.display = 'none'; try { fixSize(); } catch (e) {} }
+    }, 8000);
+
+    // 1) 服务端矢量图层：App 传了 layers=id1,id2 时只显示勾选的图层（可运行时切换）
+    var layerParam = q.get('layers');
+    var layerFilterOn = layerParam !== null;
+    var selectedIds = String(layerParam || '').split(',').filter(function (s) { return s !== ''; });
+    var layerGroups = {};
+    var layerMeta = {};
+    function isLayerOn(layer) {
+      if (!layerFilterOn) return layer.visible !== false;
+      return selectedIds.indexOf(String(layer.id)) >= 0;
+    }
+    function refreshLayerCount() {
+      var n = 0;
+      for (var k in layerGroups) { if (map.hasLayer(layerGroups[k])) n++; }
+      var el = document.getElementById('c-layer');
+      if (el) el.textContent = n;
+    }
+    // 标注文字颜色跟随图层颜色：按颜色动态生成 CSS 类（透明底，只改文字色）
+    var labelStyleEl = document.createElement('style');
+    document.head.appendChild(labelStyleEl);
+    var labelClassMap = {};
+    function labelClass(color) {
+      var c = String(color || '#1b3b1f');
+      var cls = 'lbl-' + c.replace(/[^0-9a-zA-Z]/g, '');
+      if (!labelClassMap[cls]) {
+        labelClassMap[cls] = true;
+        labelStyleEl.textContent += '.' + cls + '{color:' + c + ';}';
+      }
+      return 'layer-label ' + cls;
+    }
+    // 供 App 调用：图层勾选变化时即时切换（不重载页面，保留地图位置）
+    window.setLayerSelection = function (csv) {
+      selectedIds = String(csv || '').split(',').filter(function (s) { return s !== ''; });
+      layerFilterOn = true;
+      // build133：**全量重建**，不再增量增删。
+      // 症状：勾选新增图层后，已有图层（蓝/红/绿网格）整体变大并位移。
+      // 原因：Leaflet 增量 addTo 只重画"新加的"图层，已有图层不会重新投影，之前残留的
+      // 错误变换就一直显形。做法：先把所有图层从地图移除，再按勾选重新 addTo——
+      // 每个图形都会按**当前**视野/尺寸重新投影一次，保证同一时刻所有图层一致。
+      for (var id in layerGroups) {
+        try { if (map.hasLayer(layerGroups[id])) map.removeLayer(layerGroups[id]); } catch (e) {}
+      }
+      for (var id2 in layerGroups) {
+        if (selectedIds.indexOf(String(id2)) >= 0) { try { layerGroups[id2].addTo(map); } catch (e) {} }
+      }
+      refreshLayerCount();
+      redrawVectors();
+    };
+
+    // 本地化图层：数据同步时已把图层 GeoJSON 下载到手机，App 传入 localLayers + proxy，
+    // 页面改为从本地代理读取（无网也能显示图层）；没本地化的仍走服务端地址。
+    var localLayerIds = String(q.get('localLayers') || '').split(',').filter(function (s) { return s !== ''; });
+    var proxyBase = (q.get('proxy') || '').trim();
+
+    // build184：App 下发的**本地图层元数据**（JSON 数组，来自手机本地库）。
+    // 离线时 /api/layers 根本请求不到，旧实现重试 3 次后放弃 —— 哪怕 GeoJSON 早已下载到本机，
+    // 也会一个图层都不画（现场表现就是「离线进入 App，图层全没了」）。
+    // 有这份元数据就完全不走网络：列表直接用它，GeoJSON 走本地代理（127.0.0.1）。
+    var layerMetaLocal = null;
+    try {
+      var lmRaw = q.get('layerMeta');
+      if (lmRaw) layerMetaLocal = JSON.parse(lmRaw);
+    } catch (e) { layerMetaLocal = null; }
+    if (!Array.isArray(layerMetaLocal) || !layerMetaLocal.length) layerMetaLocal = null;
+
+    /** 清空已叠加的矢量图层（重复加载前先清，保证幂等，不会叠出两层） */
+    function clearVectorLayers() {
+      for (var id in layerGroups) {
+        try { if (map.hasLayer(layerGroups[id])) map.removeLayer(layerGroups[id]); } catch (e) {}
+      }
+      layerGroups = {};
+      refreshLayerCount();
+    }
+    /** 带重试的 GeoJSON 拉取：doFetch(attempt) → 成功回调 geo；3 次都失败回调 null */
+    function fetchGeoWithRetry(url, attempt, cb) {
+      api2(url).then(function (geo) {
+        if (geo) { cb(geo); return; }
+        if (attempt < 3) {
+          setTimeout(function () { fetchGeoWithRetry(url, attempt + 1, cb); }, 700 * attempt);
+          return;
+        }
+        cb(null);
+      });
+    }
+    /**
+     * 把一批图层元数据渲染成 Leaflet 图层组（同一 id 先移除旧组，保证幂等）。
+     * build184：从 loadVectorLayers 里抽出来——不论列表来自本地（离线）还是服务端，
+     * 渲染逻辑只此一份，避免两条路径行为不一致。
+     */
+    function renderLayerList(arr) {
+      layerMeta = {};
+      arr.forEach(function (layer) {
+        layerMeta[layer.id] = layer;
+        var raw = layer.url || '';
+        if (!/^https?:\/\//.test(raw)) raw = serverRoot + '/' + raw.replace(/^\//, '');
+        var geoUrl = raw.replace(/\.(shp|kmz|kml)$/i, '.geojson');
+        // 本机已有该图层 → 走本地代理（代理里没有再回源，代理地址里带上 u= 上游地址）
+        if (proxyBase && localLayerIds.indexOf(String(layer.id)) >= 0) {
+          geoUrl = proxyBase + '/l/' + layer.id + '?u=' + encodeURIComponent(geoUrl);
+        }
+        fetchGeoWithRetry(geoUrl, 1, function (geo) {
+          if (!geo) return;
+          // 同一图层重复加载时，先移除旧的组，避免叠加
+          var old = layerGroups[layer.id];
+          if (old) { try { if (map.hasLayer(old)) map.removeLayer(old); } catch (e) {} }
+          var color = layer.color || '#1b5e20';
+          var grp = L.geoJSON(geo, {
+            style: { color: color, weight: 2.5, fill: false },
+            pointToLayer: function (f, ll) {
+              var m = L.circleMarker(ll, { radius: 5, color: color, fillColor: color, fillOpacity: 0.85, weight: 2 });
+              var txt = layer.label_field && f.properties ? f.properties[layer.label_field] : null;
+              // build103：点要素不再常驻文字（点密集时会叠成一片，很"花"），
+              // 改为点击/触摸该点才显示标注；线/面要素仍常驻（数量少、位置固定）。
+              if (txt !== null && txt !== undefined && txt !== '') {
+                m.bindTooltip(String(txt), { direction: 'right', offset: [6, 0], className: labelClass(color) });
+              }
+              return m;
+            },
+            onEachFeature: function (f, lyr) {
+              var name = layer.label_field ? (f.properties && f.properties[layer.label_field]) : null;
+              if (name) {
+                lyr.bindPopup(popupHtml(layer.name, String(name)));
+                // 线/面要素：在图形中心显示标注文字
+                if (f.geometry && f.geometry.type !== 'Point') {
+                  lyr.bindTooltip(String(name), { permanent: true, direction: 'center', className: labelClass(color) });
+                }
+              }
+            }
+          });
+          layerGroups[layer.id] = grp;
+          if (isLayerOn(layer)) grp.addTo(map);
+          refreshLayerCount();
+          redrawVectors();   // build131：按当前尺寸重绘，避免"压扁"要等下次图层变动才恢复
+        });
+      });
+      setStatus('图层 ' + arr.length + ' 个' + (layerMetaLocal === arr ? '（本地）' : ''));
+      refreshLayerCount();
+    }
+
+    /**
+     * 加载矢量图层（幂等，可重复调用）。
+     * 旧实现是内联一次性请求：任一 GeoJSON 失败就被 `.catch` 静默丢弃、永不重试，
+     * 于是"切底图（整页重载）后图层不显示"就一直好不了。现在：
+     * - 图层列表最多重试 3 次；
+     * - 每个图层的 GeoJSON 单独最多重试 3 次（间隔递增）；
+     * - 暴露 window.reloadLayers 给 App 兜底重拉，window.layerCount 供 App 自检。
+     * build184：**有本地元数据就不请求 /api/layers**——离线进入 App 也能出图层。
+     */
+    function loadVectorLayers() {
+      clearVectorLayers();
+      if (layerMetaLocal) {
+        renderLayerList(layerMetaLocal);
+        tick();
+        return;
+      }
+      function tryLayers(attempt) {
+        api('layers').then(function (layers) {
+          renderLayerList(Array.isArray(layers) ? layers : []);
+          tick();
+        }).catch(function (e) {
+          if (attempt < 3) {
+            setTimeout(function () { tryLayers(attempt + 1); }, 700 * attempt);
+            return;
+          }
+          dataErr('图层', e);
+          tick();
+        });
+      }
+      tryLayers(1);
+    }
+    // build184：图层配置更新（同步到新图层/改了颜色）时由 App 调用。
+    // 元数据没变就不重建（在线时页面已从服务端加载过，避免白闪一次）。
+    window.setLayerMeta = function (json) {
+      var arr = null;
+      try { arr = JSON.parse(String(json || '')); } catch (e) { arr = null; }
+      if (!Array.isArray(arr) || !arr.length) return;
+      var same = Object.keys(layerGroups).length === arr.length &&
+        arr.every(function (l) { return layerGroups[l.id] !== undefined; });
+      layerMetaLocal = arr;
+      if (!same) loadVectorLayers();
+    };
+    // 供 App 兜底：页面自检发现"应有图层但一个都没出来"时重拉
+    window.reloadLayers = loadVectorLayers;
+    // 供 App 自检：当前已建组的图层数量
+    window.layerCount = function () {
+      var n = 0;
+      for (var k in layerGroups) { n++; }
+      return n;
+    };
+    // 任务地图（URL 带 task=任务id）：只显示该任务的航迹与采集点，
+    // 不叠加服务端矢量图层、不显示人员点/任务计数、不做定位、不长按取坐标。
+    var taskId = parseInt(q.get('task') || '', 10);
+    var isTaskMap = isFinite(taskId) && taskId > 0;
+    // build132：**等容器尺寸稳定后再加载图层**（build147：任务航迹页也走这条——
+    // 用户在任务页同样要看矢量图层；isTaskMap 仅负责关闭定位/长按/人员点，不再抑制图层）。
+    // 症状：先按错误的初始尺寸把图层画上去，之后尺寸修正却不会重投影，于是
+    // "再加一个图层触发重算时，已有图层才跳到正确形状"——看起来就是加图层导致变形。
+    (function waitSize(n) {
+      var sz = map.getSize();
+      if (sz && sz.x >= 60 && sz.y >= 60) { loadVectorLayers(); return; }
+      if (n > 50) { loadVectorLayers(); return; }   // 兜底：最多等 5 秒
+      setTimeout(function () { waitSize(n + 1); }, 100);
+    })(0);
+    if (isTaskMap) {
+      // 任务航迹页：没有图层、也没有人员点，图例（采集点 / 在线人员 / 离线人员）在这里没有意义，直接隐藏
+      var lgTask = document.querySelector('.legend');
+      if (lgTask) lgTask.style.display = 'none';
+      // 任务航迹的数据全部由 App 注入、不请求接口，立刻收起「正在加载地图数据…」遮罩，
+      // 否则要等 8 秒兜底计时器才消失
+      var ldTask = document.getElementById('loading');
+      if (ldTask) ldTask.style.display = 'none';
+      // build119：任务详情只保留"地图 + 航迹 + 采集点"，去掉与查看航迹无关的元素
+      //（比例尺、缩放按钮、图例、顶部信息条），视野由 setMyTrace 的 fitBounds 自动框住。
+      // build120 修正：这里原来误写成 `map.remove()`——那是**销毁整个地图实例**
+      //（Leaflet 的 Map.remove()），导致任务页地图框里连底图和航迹都画不出来，
+      // 瓦片计数也就永远是 ok:0/err:0。正确写法是移除缩放控件本身。
+      try { if (scaleCtrl) map.removeControl(scaleCtrl); } catch (e) {}
+      try { if (map.zoomControl) map.zoomControl.remove(); } catch (e) {}
+    }
+
+    // 2) 航迹 + 采集点：统一由 App 调用 window.setMyTrace(points, records) 注入
+    //    - 主地图：只在「本机正在记录航迹」期间显示本人航迹与本人采集点，停止记录后清空；
+    //    - 任务地图：显示该任务的航迹与该任务的采集点。
+    //    旧实现是主地图直接拉服务端全部记录并常驻显示，导致「停止记录后地图上还留着点」。
+    var traceLine = null, traceDots = [];
+    function clearMyTrace() {
+      if (traceLine) { try { map.removeLayer(traceLine); } catch (e) {} traceLine = null; }
+      traceDots.forEach(function (m) { try { map.removeLayer(m); } catch (e) {} });
+      traceDots = [];
+    }
+    var traceFitted = false;
+    // build155：上一次注入的「航迹身份」签名（分组键 + 每组首点坐标）。
+    // 用于判断这次注入的是**另一条航迹**（切换流水号）还是同一条在实时长点。
+    var lastTraceKey = null;
+    var pendingFit = null;  // build126：尺寸未就绪时延迟 fitBounds，避免 NaN 缩放
+    function dotIcon(color, size) {
+      return L.divIcon({
+        className: '', html: '<div style="width:' + size + 'px;height:' + size + 'px;border-radius:50%;background:' + color + ';border:2.5px solid #fff;box-shadow:0 0 4px rgba(0,0,0,.5)"></div>',
+        iconSize: [size, size], iconAnchor: [size / 2, size / 2]
+      });
+    }
+    // 起/终 文字圆点图标：彩色圆 + 居中汉字（起=绿、终=红），className 留空避免 Leaflet 默认白底方框
+    function textCircleIcon(text, color) {
+      var s = 30;
+      return L.divIcon({
+        className: '',
+        html: '<div style="width:' + s + 'px;height:' + s + 'px;border-radius:50%;background:' + color + ';' +
+              'color:#fff;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;' +
+              'border:2.5px solid #fff;box-shadow:0 0 4px rgba(0,0,0,.5)">' + text + '</div>',
+        iconSize: [s, s], iconAnchor: [s / 2, s / 2]
+      });
+    }
+    window.setMyTrace = function (points, records, opts) {
+      clearMyTrace();
+      var pts = Array.isArray(points) ? points : [];
+      var recs = Array.isArray(records) ? records : [];
+      // build156（按用户要求）：**任务没结束就不画终点**。
+      // 只有 App 明确告知「这一轮已经点过完成任务」（opts.finished === true）时才画「终」；
+      // 进行中的航迹只有「起」，终点要么等真的完成任务，要么等任务航迹页查看已完成作业时才出现。
+      var showEnd = !!(opts && opts.finished === true);
+      var latlngs = [];
+      pts.forEach(function (p) {
+        if (p && isFinite(p.lat) && isFinite(p.lng)) latlngs.push([Number(p.lat), Number(p.lng)]);
+      });
+      var recLatLngs = [];
+      recs.forEach(function (r) {
+        if (r && isFinite(r.lat) && isFinite(r.lng)) recLatLngs.push([Number(r.lat), Number(r.lng)]);
+      });
+      // 航迹：橙色折线 + 起(绿)/终(红) 文字圆点标记
+      // build117（按用户反馈）：折线**按任务分组**绘制。旧实现把所有轨迹点按时间合并成一条线，
+      // 多个任务并行记录时两组点交替连线，线就来回穿越、看着和采集点完全对不上。
+      // build121：起点用「起」(绿)、终点用「终」(红) 文字圆点标记，便于一眼辨认航迹首尾。
+      var groups = {}, order = [];
+      pts.forEach(function (p) {
+        if (!p || !isFinite(p.lat) || !isFinite(p.lng)) return;
+        var k = (p.trackId == null ? 'x' : String(p.trackId));
+        if (!groups[k]) { groups[k] = []; order.push(k); }
+        groups[k].push([Number(p.lat), Number(p.lng), p.time || '']);
+      });
+      // 起/终按**航迹点本身**的首尾取（不受下方"采集点并入折线"影响，终点是航迹终点而非最后一条填报）
+      var ends = {};
+      order.forEach(function (k) {
+        var g0 = groups[k].slice().sort(function (a, b) { return String(a[2]).localeCompare(String(b[2])); });
+        ends[k] = [g0[0], g0[g0.length - 1]];
+      });
+      // build155（按用户要求）：切换到另一条流水号时，把视野**重新框到这条航迹**的范围。
+      // 用「分组键 + 每组首点坐标」做签名判断是不是另一条航迹：
+      //   换一条号 → 签名变 → 允许重新 fitBounds；
+      //   同一条号在实时轮询（点数增加）→ 签名不变 → 不重复拉视野，不打断用户拖动/缩放。
+      var sigParts = order.filter(function (k) { return ends[k] && ends[k][0]; })
+        .map(function (k) { return k + '@' + ends[k][0][0] + ',' + ends[k][0][1]; });
+      var traceKey = sigParts.join(';');
+      if (traceKey !== lastTraceKey) { lastTraceKey = traceKey; traceFitted = false; }
+      // build118：任务详情页只有一条航迹时，把**采集点也并入折线顶点**（按时间归位）。
+      // 原因：折线是按航迹采样点连的，蓝点是按填报那一刻的定位画的，两者时刻不同，
+      // 本来就可能差几十米——看起来就像"采集点和航迹不重合"。并进去后线必然穿过每个点。
+      if (order.length === 1) {
+        recs.forEach(function (r) {
+          if (!r || !isFinite(r.lat) || !isFinite(r.lng)) return;
+          groups[order[0]].push([Number(r.lat), Number(r.lng), r.time || '']);
+        });
+      }
+      order.forEach(function (k) {
+        var g = groups[k];
+        if (!g || !g.length) return;
+        // build118：按时间排序再连线。服务端/数据库返回的点序不保证有序，
+        // 无序直接连线会被画成"来回穿梭"的折线，看起来和采集点完全不搭。
+        g.sort(function (a, b) { return String(a[2]).localeCompare(String(b[2])); });
+        if (g.length > 1) {
+          var ptsArr = g.map(function (a) { return [a[0], a[1]]; });
+          // 白色描边（下层，加宽）让线在任何底图/点上都清晰；橙色主线（上层）。
+          // 均放在 tracePane（z=630，高于点标记），保证线始终看得见。
+          var halo = L.polyline(ptsArr, { color: '#FFFFFF', weight: 9, opacity: 0.95, pane: 'tracePane' }).addTo(map);
+          var line = L.polyline(ptsArr, { color: '#D84315', weight: 5, opacity: 1, pane: 'tracePane' }).addTo(map);
+          traceDots.push(halo); traceDots.push(line);   // 与点共用清理列表（removeLayer 同样作用于折线）
+        }
+      });
+      // 起/终标记：起点「起」(绿) 一直有；终点「终」(红) **只在完成后**画（任务进行中不显示终点）
+      order.forEach(function (k) {
+        var e = ends[k]; if (!e || !e[0]) return;
+        var s = e[0], t = e[1];
+        traceDots.push(L.marker([s[0], s[1]], { icon: textCircleIcon('起', '#2E7D32'), pane: 'traceTopPane', zIndexOffset: 1000 }).addTo(map));
+        if (showEnd && t && (t[0] !== s[0] || t[1] !== s[1])) {
+          traceDots.push(L.marker([t[0], t[1]], { icon: textCircleIcon('终', '#DC2626'), pane: 'traceTopPane', zIndexOffset: 1000 }).addTo(map));
+        }
+      });
+      // 采集点：蓝点（点击看「填写的表格名称」+ 时间/经纬度/海拔）
+      recs.forEach(function (r, i) {
+        if (!r || !isFinite(r.lat) || !isFinite(r.lng)) return;
+        // 标题优先用 App 下发的表格名称（r.title）；没有时才退回「采集点 #编号」
+        var nm = String(r.title || '').replace(/</g, '&lt;');
+        var head = nm ? nm : ('采集点' + (recs.length > 1 ? ' #' + (i + 1) : ''));
+        var html = popupHtml(head,
+          (r.time ? ('时间：' + r.time + '\n') : '') +
+          ('经纬度：' + Number(r.lat).toFixed(5) + ', ' + Number(r.lng).toFixed(5)) +
+          (r.alt != null ? ('\n海拔：' + Math.round(r.alt) + ' m') : ''));
+        traceDots.push(L.marker([Number(r.lat), Number(r.lng)], { icon: dotIcon('#2563EB', 16), pane: 'recordPane' })
+          .addTo(map).bindPopup(html));
+      });
+      // 首次拿到数据时把视野收到航迹/采集点范围；之后不再自动移动（避免打断用户拖动/定位）
+      if (!traceFitted) {
+        var all = latlngs.concat(recLatLngs);
+        var sz0 = map.getSize();
+        if (!(sz0 && sz0.x >= 60 && sz0.y >= 60)) {
+          // 尺寸还没就绪：不要在此刻 fitBounds（会算出 NaN 缩放把整图搞废），
+          // 记下范围，等 fixSize 拿到真实尺寸后再补 fit。
+          pendingFit = all;
+        } else if (all.length === 1) {
+          map.setView(all[0], Math.max(map.getZoom() || 0, 16)); traceFitted = true;
+        } else if (all.length > 1) {
+          try { map.fitBounds(L.latLngBounds(all), { padding: [40, 40] }); traceFitted = true; } catch (e) {}
+        }
+      }
+      // 清空（离开任务/无数据）时把签名一起复位，下次回到同一条流水号仍能重新框选
+      if (!latlngs.length && !recLatLngs.length) { traceFitted = false; lastTraceKey = null; }
+      var cRec = document.getElementById('c-rec');
+      if (cRec) cRec.textContent = recLatLngs.length;
+      if (latlngs.length || recLatLngs.length) {
+        setStatus((isTaskMap ? '任务航迹 ' : '本人航迹 ') + latlngs.length + ' 点 · 采集点 ' + recLatLngs.length + ' 个');
+      }
+      // build126：诊断——本次注入的轨迹点/采集点/折线数，地图空白时可快速定位
+      lastTraceInfo = { pts: latlngs.length, rec: recLatLngs.length, line: traceDots.length, fitted: traceFitted };
+    };
+    var lastTraceInfo = { pts: 0, rec: 0, line: 0, fitted: false };
+
+
+    // 3) 在线人员（返回 { onlineCount, staleCount, total, list }）——任务地图不显示（只看该任务航迹与采集点）
+    // App 通过 URL 的 me= 传入当前登录用户 id：本人的点不画（由蓝色定位箭头表示）。
+    var meId = String(q.get('me') || '').trim();
+    if (!isTaskMap) {
+      var peopleLayer = L.layerGroup().addTo(map);
+      function statusOf(p) {
+        if (p.status) return String(p.status);
+        return p.online ? 'online' : 'offline';
+      }
+      function agoText(sec) {
+        if (sec == null) return '';
+        var s = Math.max(0, Math.round(sec));
+        // build174：服务端偶发给出失控的 seconds_ago（App 上报的 at 不是有效 ISO 时间时可达 17 亿秒），
+        // 超过 1 年就不显示时间，免得气泡里写"位置 56 年前"。
+        if (s > 365 * 86400) return '';
+        if (s < 60) return '位置 ' + s + ' 秒前';
+        if (s < 3600) return '位置 ' + Math.round(s / 60) + ' 分钟前';
+        return '位置 ' + Math.round(s / 3600) + ' 小时前';
+      }
+      function drawPeople(resp) {
+        var arr = (resp && Array.isArray(resp.list)) ? resp.list : (Array.isArray(resp) ? resp : []);
+        var on = 0;
+        peopleLayer.clearLayers();
+        arr.forEach(function (p) {
+          if (p.lat == null || p.lng == null) return;
+          // build119：管理员不上图。管理员登录网页后台后，其历史定位会被"最近调用过接口"
+          // 的在线判定带回列表，出现在巡护地图上——后台账号不需要在地图上显示位置。
+          if (p.role && String(p.role).indexOf('管理员') >= 0) return;
+          var st = statusOf(p);
+          // build176：在线人数**含本人**（顶部只统计在线个数，不再与"有位置的人数"混算）；
+          // 先计数再跳过本人，这样网页地图顶部数字与 App 顶栏「在线 N 人」一致。
+          if (st === 'online') on++;
+          // build175：**跳过本人不画点**——本人的位置已经由地图上的蓝色定位箭头表示，
+          // 再画一个点会与箭头重合，看着像"多了一个人"。
+          if (!!meId && p.user_id != null && String(p.user_id) === meId) return;
+          var color = (st === 'online') ? '#16A34A' : '#9CA3AF';
+          var statTxt = st === 'online' ? '在线' : (st === 'stale' ? '位置过期' : '离线');
+          var size = 15;
+          var html = '<div style="width:' + size + 'px;height:' + size + 'px;border-radius:50%;background:' +
+            color + ';border:2px solid #fff;box-shadow:0 0 3px rgba(0,0,0,.45)"></div>';
+          L.marker([p.lat, p.lng], { icon: L.divIcon({ className: '', html: html, iconSize: [size, size] }) })
+            .addTo(peopleLayer)
+            .bindPopup(popupHtml(
+              (p.name || '人员'),
+              (p.role || '') + ' · ' + (p.org || '') + ' · ' + statTxt +
+              (p.seconds_ago != null ? ' · ' + agoText(p.seconds_ago) : '')
+            ));
+        });
+        var el = document.getElementById('c-on');
+        if (el) el.textContent = on;
+      }
+      // build173：人员位置每 30 秒刷新一次（与原生引擎侧的轮询节奏一致）。
+      // 旧实现只在页面加载时取一次，队友走了地图上的点还停在原地。
+      function loadPeople() {
+        return api('locations/online').then(drawPeople).catch(function (e) { dataErr('人员', e); });
+      }
+      window.reloadPeople = loadPeople;
+      loadPeople().then(tick);
+      setInterval(loadPeople, 30000);
+    }
+
+    // 4) 任务（无经纬度，仅计数）——任务地图不需要
+    if (!isTaskMap) {
+      api('tasks').then(function (tasks) {
+        var arr = Array.isArray(tasks) ? tasks : [];
+        setStatus('任务 ' + arr.length + ' 个');
+      }).catch(function (e) { /* 忽略 */ })
+        .then(tick);
+    }
+
+    // ===== 定位：右下角按钮触发 + 首次加载自动定位居中 =====
+    var meMarker = null;
+    var meBearing = 0;   // 设备朝向（度，0=正北）：定位点箭头据此旋转
+    function meArrowSvg() {
+      // build166：白色圆底 + 蓝色导航箭头（箭头完全收在 24px 圆内，随朝向旋转）。
+      // build167：图标固定 24×24（比采集点 16px 略大），不再带随精度变化的精度圈。
+      // build168（用户反馈"三角形太小"）：箭头按白圆比例放大到 62% 半径——
+      // 尖端 y=4.8、底边 y=18.8、半宽 5.6、缺口 y=15.8；到底边尖角最远 8.8 < 圆半径 12。
+      // 放大后箭头长度 14px（原 10.6）、宽度 11.2px（原 7.8），在白圆里撑得开、方向一眼可读。
+      // build179：整体恢复 24px（build178 的缩放撤回），箭头占圆比例不变。
+      return '<div class="me-dot">' +
+        '<div class="me-badge"></div>' +
+        '<div class="me-head" style="transform:rotate(' + meBearing + 'deg)">' +
+        '<svg viewBox="0 0 24 24" width="24" height="24">' +
+        '<path d="M12 4.8 L17.6 18.8 L12 15.8 L6.4 18.8 Z" ' +
+        'fill="#1E6FF1" stroke="#FFFFFF" stroke-width="0.7" stroke-linejoin="round"/>' +
+        '</svg></div>' +
+        '</div>';
+    }
+    /** 旋转定位点箭头（App 每次方位角变化时调用；没有定位点时不动作） */
+    var lastBearTs = 0;
+    window.setMyBearing = function (deg) {
+      var d = parseFloat(deg) || 0;
+      var now = Date.now();
+      // build142：频率限制(>=120ms 才更新) + 角度阈值(3°)——
+      // 传感器每秒几十次抖动会让箭头反复重绘，看上去像"闪"。
+      if (now - lastBearTs < 120) return;
+      if (Math.abs(d - meBearing) < 3) return;
+      lastBearTs = now;
+      meBearing = d;
+      var el = meMarker && meMarker.getElement ? meMarker.getElement() : null;
+      var inner = el ? el.querySelector('.me-head') : null;
+      if (inner) inner.style.transform = 'rotate(' + meBearing + 'deg)';
+    };
+    // 中国范围粗略边界：定位点落在范围外（如模拟器默认 GPS 在美国）时不移动地图，避免"乱跳"
+    function inChina(la, ln) { return la >= 15 && la <= 55 && ln >= 72 && ln <= 136; }
+    // 把定位点画到地图上并居中（App 侧已拿到坐标时直接调它，不依赖 WebView 的地理定位）
+    // 精度圈：**build167 起取消**。原实现按 GPS 精度在 34~86px 之间改图标大小，
+    // 定位刷新时肉眼看到的就是"图标在放大缩小"。现在图标固定 24px，与精度无关。
+    // 函数保留成空实现：applyMyLocation / followMe 仍在调用，避免改动调用链。
+    function updateAccCircle(la, ln, acc) { /* 固定尺寸，不再按精度变化 */ }
+    function applyMyLocation(la, ln, acc, tip) {
+      if (!inChina(la, ln)) { setStatus('定位异常（获取到 ' + la.toFixed(3) + ', ' + ln.toFixed(3) + '），已忽略'); return; }
+      if (!meMarker) {
+        meMarker = L.marker([la, ln], {
+          // build179：定位点在**最高 pane**（z=670，压过航迹线 630 / 起终 640 / 采集点 650，但低于气泡 700）
+          icon: L.divIcon({ className: '', html: meArrowSvg(), iconSize: [24, 24], iconAnchor: [12, 12] }),
+          pane: 'mePane', zIndexOffset: 900, interactive: false
+        }).addTo(map);
+      } else { meMarker.setLatLng([la, ln]); }
+      updateAccCircle(la, ln, acc);   // build144：marker 建好后再按精度设圈大小
+      // 居中到当前位置（保持不小于 14 级，看得清周边）
+      map.setView([la, ln], Math.max(map.getZoom(), 14));
+      setStatus(tip || '已定位');
+    }
+    // App 通道：window.locateAt(纬度, 经度) —— 用安卓端 GPS 结果，离线同样可用
+    window.locateAt = function (la, ln, acc) {      if (isTaskMap) return;   // 任务地图不做定位（只看该任务航迹与采集点）
+      la = parseFloat(la); ln = parseFloat(ln);
+      if (!isFinite(la) || !isFinite(ln)) return;
+      applyMyLocation(la, ln, acc, '已定位');
+    };
+    // build119：**实时跟随**——App 每 5 秒推一次当前位置，这里只移动定位图标、
+    // **不重新居中**（否则用户拖动地图看别处时会被一直拽回当前位置）。
+    // build142：GPS 每次刷新即使只抖 1~2 米也会挪动图标，半透明光晕跟着移动就会"闪"。
+    // 加最小位移阈值：2 米以内不移动图标（位置足够精确时图标保持静止）。
+    var meLastLL = null;
+    function movedMeters(la, ln) {
+      if (!meLastLL) return 999;
+      var dy = (la - meLastLL[0]) * 110540;
+      var dx = (ln - meLastLL[1]) * 111320 * Math.cos(la * Math.PI / 180);
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    window.followMe = function (la, ln, acc) {
+      if (isTaskMap) return;
+      la = parseFloat(la); ln = parseFloat(ln);
+      if (!isFinite(la) || !isFinite(ln) || !inChina(la, ln)) return;
+      // 位置：2 米内不动（防 GPS 抖动导致图标乱抖）
+      if (!meMarker || movedMeters(la, ln) >= 2) {
+        meLastLL = [la, ln];
+        if (!meMarker) {
+          meMarker = L.marker([la, ln], {
+            // build179：与 applyMyLocation 一致——24px 实心白圆 + mePane（最高层，压住航迹）
+            icon: L.divIcon({ className: '', html: meArrowSvg(), iconSize: [24, 24], iconAnchor: [12, 12] }),
+            pane: 'mePane', zIndexOffset: 900, interactive: false
+          }).addTo(map);
+        } else {
+          meMarker.setLatLng([la, ln]);
+        }
+      }
+      // build144：圈大小只看精度（有 8% 阈值），不受 2 米位移阈值限制
+      updateAccCircle(la, ln, acc);
+    };
+    function locateMe() {
+      if (isTaskMap) return;
+      if (!navigator.geolocation) { setStatus('设备不支持定位'); return; }
+      setStatus('正在定位…');
+      navigator.geolocation.getCurrentPosition(function (pos) {
+        applyMyLocation(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy, '已定位（误差约 ' + Math.round(pos.coords.accuracy) + ' 米）');
+      }, function (err) {
+        var m = { 1: '定位权限被拒绝：请在系统设置中允许本应用使用位置权限', 2: '暂时获取不到位置，请到空旷处重试', 3: '定位超时，请重试' };
+        setStatus('定位失败：' + (m[err && err.code] || '未知错误'));
+      }, { enableHighAccuracy: true, timeout: 12000, maximumAge: 15000 });
+    }
+    window.locateMe = locateMe;
+    // 页面数据加载完成后自动定位一次，让地图直接显示当前位置并居中（任务地图不定位）
+    setTimeout(function () { try { if (!isTaskMap && !meMarker) locateMe(); } catch (e) {} }, 1500);
+
+    // ===== 长按显示经纬度 =====
+    // 开关由网页端「地图管理 → 底图配置」下发，App 以 longpress=0/1 传入；任务地图一律不长按取坐标
+    var longPressOn = q.get('longpress') !== '0' && !isTaskMap;
+    var coordPopup = null;
+    var coordDot = null;            // 长按位置的小点（始终只留最新一个）
+    function removeCoordDot() {
+      if (coordDot) { try { map.removeLayer(coordDot); } catch (e) {} coordDot = null; }
+    }
+    // 气泡关闭（点 ×）后，长按小点一并移除，避免小点留在地图上无法清除
+    map.on('popupclose', function (ev) {
+      if (coordPopup && ev && ev.popup === coordPopup) removeCoordDot();
+    });
+    map.on('contextmenu', function (e) {
+      if (!longPressOn || !e || !e.latlng) return;
+      var la = e.latlng.lat, ln = e.latlng.lng;
+      if (coordPopup) { try { map.closePopup(coordPopup); } catch (err) {} }
+      removeCoordDot();
+      coordDot = L.circleMarker([la, ln], {
+        radius: 4.5, color: '#ffffff', weight: 1.5, fillColor: '#1E6FF1', fillOpacity: 1
+      }).addTo(map);
+      var html = '经度：' + ln.toFixed(6) + '<br>纬度：' + la.toFixed(6) +
+        '<br><span id="coord-alt" style="color:#666">海拔 / 坡度 / 坡向：查询中…</span>';
+      coordPopup = L.popup({ closeButton: true, autoClose: true, className: 'coord-popup' })
+        .setLatLng(e.latlng)
+        .setContent(html)
+        .openOn(map);
+      // 海拔 / 坡度 / 坡向：调服务端高程接口（离线时显示"暂无数据"）
+      try {
+        fetch(server + '/geo/elevation?lat=' + la + '&lng=' + ln)
+          .then(function (r) { return r.json(); })
+          .then(function (j) {
+            var el = document.getElementById('coord-alt');
+            if (!el) return;
+            if (j && j.alt != null) {
+              var s = '海拔：' + j.alt + ' m';
+              if (j.slope != null) s += '<br>坡度：' + j.slope + '°';
+              if (j.aspect != null) s += '<br>坡向：' + (j.aspectLabel || '') + ' ' + j.aspect + '°';
+              el.innerHTML = s;
+            } else el.textContent = '海拔：暂无数据';
+          })
+          .catch(function () {
+            var el = document.getElementById('coord-alt');
+            if (el) el.textContent = '海拔：暂无数据';
+          });
+      } catch (err) {}
+    });
+    // 长按地图时屏蔽系统/浏览器的选择与默认菜单
+    document.addEventListener('contextmenu', function (ev) { ev.preventDefault(); });
+    document.body.style.webkitUserSelect = 'none';
+
+    // ===== 测量长度 / 面积（App 工具条切换，点击地图取点）=====
+    var R = 6371008.8;
+    var measureMode = null;          // null / 'length' / 'area'
+    var measurePts = [];             // [{lat,lng}]
+    var measureLayer = null;         // 连线（Polyline / Polygon）
+    var measureDots = [];            // 取点小圆
+    // 测量图形统一放进图层组：清除时 clearLayers() 一次清干净（逐个 removeLayer 容易漏）
+    var measureGroup = null;
+    try { measureGroup = L.layerGroup().addTo(map); } catch (e) { measureGroup = null; }
+    // 测量专用 Canvas 渲染器：老 WebView 软件渲染下 SVG 图层移除后常常不重绘（点看着还在），
+    // Canvas 是整幅重画，移除后必然刷新。
+    var measureRenderer = null;
+    try { measureRenderer = L.canvas({ padding: 0.3 }).addTo(map); } catch (e) { measureRenderer = null; }
+    function toRad(d) { return d * Math.PI / 180; }
+    function distM(a, b) {
+      var dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);
+      var la1 = toRad(a.lat), la2 = toRad(b.lat);
+      var h = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(la1) * Math.cos(la2) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+      return 2 * R * Math.asin(Math.sqrt(h));
+    }
+    function pathLen(pts) { var s = 0; for (var i = 0; i < pts.length - 1; i++) s += distM(pts[i], pts[i + 1]); return s; }
+    function polyArea(pts) {
+      var n = pts.length; if (n < 3) return 0;
+      var t = 0;
+      for (var i = 0; i < n; i++) {
+        var p1 = pts[i], p2 = pts[(i + 1) % n];
+        t += toRad(p2.lng - p1.lng) * (2 + Math.sin(toRad(p1.lat)) + Math.sin(toRad(p2.lat)));
+      }
+      return Math.abs(t * R * R / 2);
+    }
+    function fmtLen(m) { return m < 1000 ? m.toFixed(1) + ' m' : (m / 1000).toFixed(2) + ' km'; }
+    function fmtArea(m2) {
+      var mu = m2 / 666.6667;
+      return m2 < 10000 ? m2.toFixed(0) + ' m²（' + mu.toFixed(2) + ' 亩）'
+                        : (m2 / 10000).toFixed(2) + ' 公顷（' + mu.toFixed(1) + ' 亩）';
+    }
+    function report(text) {
+      try { if (window.Android && window.Android.measureResult) window.Android.measureResult(text); } catch (e) {}
+    }
+    function dropMeasureLayers() {
+      // 图层组优先：一次清空组内所有点/线；没有图层组时退回逐个移除
+      if (measureGroup) { try { measureGroup.clearLayers(); } catch (e) {} }
+      if (measureLayer) { try { map.removeLayer(measureLayer); } catch (e) {} measureLayer = null; }
+      measureDots.forEach(function (d) { try { map.removeLayer(d); } catch (e) {} });
+      measureDots = [];
+      // 兜底：递归遍历（含图层组内部）找出所有带测量标记的图层并移除
+      var left = [];
+      function collectMeasure(l, depth) {
+        if (!l || depth > 5) return;
+        if (l.__measure) left.push(l);
+        if (typeof l.eachLayer === 'function') {
+          try { l.eachLayer(function (s) { collectMeasure(s, depth + 1); }); } catch (e) {}
+        }
+      }
+      try { map.eachLayer(function (l) { collectMeasure(l, 0); }); } catch (e) {}
+      left.forEach(function (l) {
+        try { map.removeLayer(l); } catch (e) {}
+        try { if (measureGroup) measureGroup.removeLayer(l); } catch (e) {}
+        try { if (measureRenderer) measureRenderer.removeLayer(l); } catch (e) {}
+      });
+      // 极端兜底：把整个图层组从地图摘掉再重建，杜绝任何残留引用
+      try { if (measureGroup) map.removeLayer(measureGroup); } catch (e) {}
+      measureGroup = null;
+      try { measureGroup = L.layerGroup().addTo(map); } catch (e) { measureGroup = null; }
+      // 强制重绘：canvas/SVG 渲染器各刷一次（软件渲染下不刷就看着"点还在"）
+      try { if (measureRenderer && measureRenderer._update) measureRenderer._update(); } catch (e) {}
+      try { if (map._renderer && map._renderer._update) map._renderer._update(); } catch (e) {}
+      try { map.invalidateSize({ animate: false }); } catch (e) {}
+    }
+    /**
+     * 递归数测量要素：必须进到图层组（LayerGroup）内部统计。
+     * 坑：map.eachLayer() 只遍历直接加到 map 上的图层，不递归图层组，
+     * 之前的写法恒返回 0，App 端以为"已经清干净"而从未重试 —— 点就一直留在地图上。
+     */
+    function countMeasureIn(l, depth) {
+      if (!l || depth > 5) return 0;
+      var c = l.__measure ? 1 : 0;
+      if (typeof l.eachLayer === 'function') {
+        try { l.eachLayer(function (sub) { c += countMeasureIn(sub, depth + 1); }); } catch (e) {}
+      }
+      return c;
+    }
+    window.measureCount = function () {
+      var n = 0;
+      try { map.eachLayer(function (l) { n += countMeasureIn(l, 0); }); } catch (e) {}
+      return n;
+    };
+    function redrawMeasure() {
+      dropMeasureLayers();
+      measurePts.forEach(function (p) {
+        var dot = L.circleMarker([p.lat, p.lng], {
+          radius: 4, color: '#ffffff', weight: 1.5, fillColor: '#E65100', fillOpacity: 1,
+          renderer: measureRenderer || undefined
+        });
+        dot.__measure = true;
+        measureDots.push(dot);
+        if (measureGroup) measureGroup.addLayer(dot); else dot.addTo(map);
+      });
+      if (measurePts.length < 2) return;
+      var latlngs = measurePts.map(function (p) { return [p.lat, p.lng]; });
+      if (measureMode === 'area') {
+        measureLayer = L.polygon(latlngs, {
+          color: '#E65100', weight: 3, fillColor: '#E65100', fillOpacity: 0.2,
+          renderer: measureRenderer || undefined
+        });
+      } else {
+        measureLayer = L.polyline(latlngs, {
+          color: '#E65100', weight: 3.5, opacity: 0.95,
+          renderer: measureRenderer || undefined
+        });
+      }
+      measureLayer.__measure = true;
+      if (measureGroup) measureGroup.addLayer(measureLayer); else measureLayer.addTo(map);
+    }
+    function measureText() {
+      var n = measurePts.length;
+      if (measureMode === 'length') {
+        return n < 2 ? '已取 1 点，继续点击下一点' : n + ' 点 · 长度 ' + fmtLen(pathLen(measurePts));
+      }
+      if (measureMode === 'area') {
+        return n < 3 ? '已取 ' + n + ' 点，至少 3 点' : n + ' 点 · 面积 ' + fmtArea(polyArea(measurePts));
+      }
+      return '';
+    }
+    function doClearMeasure() {
+      dropMeasureLayers();
+      measurePts = [];
+      if (measureMode) report('点击地图取点');
+    }
+    map.on('click', function (e) {
+      if (!measureMode || !e || !e.latlng) return;
+      measurePts.push({ lat: e.latlng.lat, lng: e.latlng.lng });
+      redrawMeasure();
+      report(measureText());
+    });
+
+    /**
+     * 硬清除：不依赖"发指令后过一会儿再回读"的时序，在同一次 JS 调用里
+     * 直接把所有测量要素从地图上摘掉，并同步返回清除后的剩余数量。
+     * 之前 App 端反复发 clearMeasure 还是"清不掉"，根因就是清除与计数分两次
+     * 执行、中间还夹着重绘，任何一环慢下来读数就还是旧的。
+     */
+    window.hardClearMeasure = function () {
+      var removed = 0;
+      // 1. 直接子层：测量点是通过图层组加到地图的，同时也是 map 的直接子层，逐个摘
+      var stack = [];
+      try { map.eachLayer(function (l) { stack.push(l); }); } catch (e) {}
+      stack.forEach(function (l) {
+        if (!l) return;
+        if (l.__measure) { try { map.removeLayer(l); removed++; } catch (e) {} }
+        // 图层组：组内可能还挂着（被 addLayer 进来但父组没同步清的）测量要素
+        if (typeof l.eachLayer === 'function') {
+          var inner = [];
+          try { l.eachLayer(function (s) { inner.push(s); }); } catch (e) {}
+          inner.forEach(function (s) {
+            if (s && s.__measure) { try { map.removeLayer(s); removed++; } catch (e) {} }
+          });
+        }
+      });
+      // 2. 测量图层组整组摘掉再重建，杜绝任何残留引用
+      try { if (measureGroup) map.removeLayer(measureGroup); } catch (e) {}
+      measureGroup = null;
+      try { measureGroup = L.layerGroup().addTo(map); } catch (e) { measureGroup = null; }
+      // 3. 状态归零
+      measurePts = [];
+      measureDots = [];
+      measureLayer = null;
+      // 4. 强制重绘（canvas 渲染器 + 地图）
+      try { if (measureRenderer && measureRenderer._update) measureRenderer._update(); } catch (e) {}
+      try { if (map._renderer && map._renderer._update) map._renderer._update(); } catch (e) {}
+      try { map.invalidateSize({ animate: false }); } catch (e) {}
+      // 5. 同步返回剩余数量（0 = 真清干净了）
+      return window.measureCount();
+    };
+
+    /**
+     * 地图视图变换（指南针跟随旋转）。
+     * 实现方式：CSS transform 整体变换 #map 容器。变换期间 Leaflet 的指针坐标
+     * 会与视觉错位，因此禁用拖拽/双击缩放/双指缩放（只看不拖，退出即恢复）。
+     *
+     * - 2D 旋转（deg≠0）：按容器宽高与角度**动态计算放大倍数**，保证旋转后
+     *   四角不露出空白（早期写死 scale(1.4)，竖屏转 45° 左右时两角会空白）。
+     */
+    var mapRot = 0;      // 方位旋转角（度，0 = 北在上）
+    function applyMapTransform() {
+      try {
+        var el = document.getElementById('map');
+        if (!el) return;
+        var w = el.clientWidth || el.offsetWidth || 1;
+        var h = el.clientHeight || el.offsetHeight || 1;
+        var t = '';
+        if (mapRot) {
+          var rad = mapRot * Math.PI / 180;
+          var cos = Math.abs(Math.cos(rad)), sin = Math.abs(Math.sin(rad));
+          // 旋转后包围盒恰能覆盖容器所需的最小倍数（宽/高取更紧的一边），再留 3% 余量
+          var need = Math.max((w * cos + h * sin) / w, (w * sin + h * cos) / h);
+          t = 'rotate(' + mapRot + 'deg) scale(' + (need * 1.03).toFixed(3) + ')';
+        }
+        el.style.transform = t;
+        // 变换期间禁用会错位的交互（程序化定位/设置视野不受影响）
+        var locked = !!mapRot;
+        try {
+          if (locked) {
+            if (map.dragging && map.dragging.disable) map.dragging.disable();
+            if (map.doubleClickZoom && map.doubleClickZoom.disable) map.doubleClickZoom.disable();
+            if (map.touchZoom && map.touchZoom.disable) map.touchZoom.disable();
+            if (map.scrollWheelZoom && map.scrollWheelZoom.disable) map.scrollWheelZoom.disable();
+          } else {
+            if (map.dragging && map.dragging.enable) map.dragging.enable();
+            if (map.doubleClickZoom && map.doubleClickZoom.enable) map.doubleClickZoom.enable();
+            if (map.touchZoom && map.touchZoom.enable) map.touchZoom.enable();
+            if (map.scrollWheelZoom && map.scrollWheelZoom.enable) map.scrollWheelZoom.enable();
+          }
+        } catch (e) {}
+      } catch (e) {}
+    }
+    /** 指南针跟随：设置方位旋转角（度）。0 / null = 恢复"北在上" */
+    window.setMapRotation = function (deg) {
+      mapRot = parseFloat(deg) || 0;
+      applyMapTransform();
+    };
+    /** 页面就绪后由 App 补发当前应有的变换状态（旋转） */
+    window.mapTransformState = function () { return { rot: mapRot }; };
+
+    /** 当前地图视野 "lat,lng,zoom"（App 端重载兜底时带上，保持用户不看的地方不变） */
+    window.mapView = function () {
+      try {
+        var c = map.getCenter();
+        return c.lat.toFixed(6) + ',' + c.lng.toFixed(6) + ',' + map.getZoom();
+      } catch (e) { return ''; }
+    };
+
+    /** 诊断用：把页面侧真实状态原样返回，便于定位"为什么清不掉" */
+    window.measureDebug = function () {
+      var direct = 0, inGroup = 0, groups = 0;
+      try {
+        map.eachLayer(function (l) {
+          if (l.__measure) direct++;
+          if (typeof l.eachLayer === 'function') {
+            groups++;
+            l.eachLayer(function (s) { if (s && s.__measure) inGroup++; });
+          }
+        });
+      } catch (e) {}
+      return JSON.stringify({
+        count: window.measureCount(),
+        mode: measureMode,
+        pts: measurePts.length,
+        direct: direct, inGroup: inGroup, groups: groups,
+        groupOnMap: !!measureGroup,
+        rendererOnMap: !!measureRenderer
+      });
+    };
+
+    // App 端接口：切换测量模式 / 清除
+    window.setMeasureMode = function (mode) {
+      measureMode = (mode === 'length' || mode === 'area') ? mode : null;
+      if (measureMode) { doClearMeasure(); report('点击地图取点'); }
+      else doClearMeasure();
+    };
+    // build121：原来这里写 `function(){ clearMeasure(); }`——而 `clearMeasure` 本身就是
+    // 挂在 window 上的同名全局函数，赋值后 window.clearMeasure 变成"调用自己"，
+    // 一调用就 RangeError: Maximum call stack size exceeded（页面报错、后续绘制中断）。
+    // 内部实现改名 doClearMeasure 后不会互相遮蔽。
+    window.clearMeasure = function () { doClearMeasure(); };
+
+    // 页面就绪信号：脚本跑完就通知 App，之后 App 下发的工具/清除指令才不会落空
+    try { if (window.Android && window.Android.mapReady) window.Android.mapReady(); } catch (e) {}
+  </script>
+</body>
+</html>
