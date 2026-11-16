@@ -62,7 +62,7 @@ jobs:
           zip -qry Patrol-unsigned.ipa Payload
 
       - name: Upload IPA
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: Patrol-unsigned-ipa
           path: ${{ steps.proj.outputs.relpath }}/build/Patrol-unsigned.ipa
