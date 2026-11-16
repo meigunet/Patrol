@@ -10,7 +10,24 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      # 项目可能在仓库根（ios-app 内容平铺），也可能在 ios-app/ 子目录，自动探测兼容两种结构
+      - name: Detect project directory
+        id: proj
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/ios-app/project.yml" ]; then
+            echo "workdir=$GITHUB_WORKSPACE/ios-app" >> "$GITHUB_OUTPUT"
+            echo "relpath=ios-app" >> "$GITHUB_OUTPUT"
+            echo "Project found in ios-app/"
+          elif [ -f "$GITHUB_WORKSPACE/project.yml" ]; then
+            echo "workdir=$GITHUB_WORKSPACE" >> "$GITHUB_OUTPUT"
+            echo "relpath=." >> "$GITHUB_OUTPUT"
+            echo "Project found in repository root"
+          else
+            echo "::error::project.yml not found in repository root or ios-app/"
+            exit 1
+          fi
 
       - name: Select Xcode
         run: |
@@ -25,11 +42,11 @@ jobs:
         run: brew install xcodegen
 
       - name: Generate project
-        working-directory: ios-app
+        working-directory: ${{ steps.proj.outputs.workdir }}
         run: xcodegen generate
 
       - name: Build unsigned IPA
-        working-directory: ios-app
+        working-directory: ${{ steps.proj.outputs.workdir }}
         run: |
           set -e
           xcodebuild -project Patrol.xcodeproj -scheme Patrol \
@@ -45,8 +62,8 @@ jobs:
           zip -qry Patrol-unsigned.ipa Payload
 
       - name: Upload IPA
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Patrol-unsigned-ipa
-          path: ios-app/build/Patrol-unsigned.ipa
+          path: ${{ steps.proj.outputs.relpath }}/build/Patrol-unsigned.ipa
           retention-days: 14
