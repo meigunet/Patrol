@@ -27,9 +27,11 @@ final class LocalServer {
         listener?.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             switch state {
-            case .ready(let p):
-                self.port = p.rawValue
-                self.baseUrl = "http://127.0.0.1:\(p.rawValue)"
+            case .ready:
+                if let p = self.listener?.port {
+                    self.port = p.rawValue
+                    self.baseUrl = "http://127.0.0.1:\(p.rawValue)"
+                }
                 ready.signal()
             case .failed, .cancelled:
                 ready.signal()
@@ -61,8 +63,8 @@ final class LocalServer {
             let headerText = String(head[..<headerEnd.lowerBound])
             let firstLine = headerText.split(separator: "\r\n").first.map(String.init) ?? ""
             let parts = firstLine.split(separator: " ")
-            let method = parts.first ?? "GET"
-            let target = parts.count >= 2 ? parts[1] : "/"
+            let method = parts.first.map(String.init) ?? "GET"
+            let target = parts.count >= 2 ? String(parts[1]) : "/"
             self.route(method: method, target: target) { status, contentType, body in
                 self.respond(conn, status: status, contentType: contentType, body: body)
             }

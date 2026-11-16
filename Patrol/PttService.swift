@@ -62,7 +62,7 @@ final class PttService: NSObject, ObservableObject, URLSessionWebSocketDelegate 
         ws?.receive { [weak self] result in
             guard let self = self else { return }
             switch result {
-            case .message(let m):
+            case .success(let m):
                 switch m {
                 case .data(let d): self.play(d)
                 case .string(let s): self.handleJson(s)
@@ -159,9 +159,10 @@ final class PttService: NSObject, ObservableObject, URLSessionWebSocketDelegate 
                 return buf
             }
             guard consumed != .error, err == nil,
-                  let chOpt = out.int16ChannelData, let ch = chOpt else { return }
+                  let ch = out.int16ChannelData else { return }
             let frames = Int(out.frameLength)
-            let bytes = Data(bytes: ch, count: frames * 2)
+            let pcm = ch[0]
+            let bytes = Data(bytes: pcm, count: frames * 2)
             // 按 640 字节切片发送
             var offset = 0
             while offset + self.chunkBytes <= bytes.count {
@@ -195,7 +196,8 @@ final class PttService: NSObject, ObservableObject, URLSessionWebSocketDelegate 
         let count = data.count / 2
         _ = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let src = raw.bindMemory(to: Int16.self).baseAddress,
-                  let dstOpt = buf.int16ChannelData, let dst = dstOpt else { return }
+                  let dstPtr = buf.int16ChannelData else { return }
+            let dst = dstPtr[0]
             for i in 0..<count { dst[i] = src[i] }
         }
         buf.frameLength = AVAudioFrameCount(count)

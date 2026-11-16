@@ -346,6 +346,7 @@ struct RecordSyncInfo: Codable {
     var clientUuid: String = ""
     var status: String = ""
     var syncedAt: String? = nil
+    var updatedAt: String? = nil
     var formTitle: String = ""
     var formVersion: Int = 0
     var taskTitle: String? = nil

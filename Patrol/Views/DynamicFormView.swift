@@ -208,7 +208,8 @@ struct DynamicFormView: View {
                 Button("重新签名") { showSignatureFor = f.key }.font(.caption)
             } else {
                 Button("手写签名") { showSignatureFor = f.key }
-                    .frame(maxWidth: .infinity, padding: 14)
+                    .frame(maxWidth: .infinity)
+                    .padding(14)
                     .background(Color.gray.opacity(0.12)).cornerRadius(8)
             }
         }

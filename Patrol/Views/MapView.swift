@@ -141,7 +141,7 @@ struct MapWebView: UIViewRepresentable {
         ]
         if !layerMeta.isEmpty { items.append(.init(name: "layerMeta", value: layerMeta)) }
         if !pickedLayers.isEmpty { items.append(.init(name: "layers", value: pickedLayers.map(String.init).joined(separator: ","))) }
-        let localIds = Store.shared.layers.filter { LocalMapStore.shared.hasLayer($0.id) }.map(String.init)
+        let localIds = Store.shared.layers.filter { LocalMapStore.shared.hasLayer($0.id) }.map { String($0.id) }
         if !localIds.isEmpty {
             items.append(.init(name: "localLayers", value: localIds.joined(separator: ",")))
             items.append(.init(name: "proxy", value: LocalServer.shared.baseUrl))
@@ -176,7 +176,7 @@ struct MapWebView: UIViewRepresentable {
             guard let web = web else { return }
             // 图层勾选
             let csv = pickedLayers.map(String.init).joined(separator: ",")
-            web.evaluateJavaScript("window.setLayerSelection && window.setLayerSelection('\(csv)')") { _ in
+            web.evaluateJavaScript("window.setLayerSelection && window.setLayerSelection('\(csv)')") { _, _ in
                 self.webReady = true
             }
             // 在线人员点 + 航迹（由页面自己拉 online，这里只注入航迹）
@@ -202,7 +202,7 @@ struct MapWebView: UIViewRepresentable {
             }
             let pj = (try? JSONSerialization.data(withJSONObject: points)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
             let rj = (try? JSONSerialization.data(withJSONObject: records)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-            web.evaluateJavaScript("window.setMyTrace && window.setMyTrace(\(pj),\(rj),{finished:false})") { _ in }
+            web.evaluateJavaScript("window.setMyTrace && window.setMyTrace(\(pj),\(rj),{finished:false})") { _, _ in }
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -242,8 +242,7 @@ struct TrackMapWebView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.preferences.javaScriptEnabled = true
         let bridge = context.coordinator
-        bridge.onReady = { [weak self] in
-            guard let self = self else { return }
+        bridge.onReady = {
             self.inject(bridge.web)
         }
         config.userContentController.add(bridge, name: "patrol")
@@ -292,7 +291,7 @@ struct TrackMapWebView: UIViewRepresentable {
         }
         let pj = (try? JSONSerialization.data(withJSONObject: pts)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
         let rj = (try? JSONSerialization.data(withJSONObject: recs)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-        web.evaluateJavaScript("window.setMyTrace && window.setMyTrace(\(pj),\(rj),{finished:true})") { _ in }
+        web.evaluateJavaScript("window.setMyTrace && window.setMyTrace(\(pj),\(rj),{finished:true})") { _, _ in }
     }
 
     final class Bridge: NSObject, WKScriptMessageHandler {

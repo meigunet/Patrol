@@ -49,7 +49,7 @@ struct RootView: View {
             // 启动门只做配置同步（含图层本地化），失败也不阻塞进入（离线可用本机数据）
             if session.isLoggedIn {
                 await MainActor.run { phase = .syncing; syncText = "正在同步服务端数据（任务/表格/底图/图层）…" }
-                await SyncService.shared.refreshConfig()
+                try? await SyncService.shared.refreshConfig()
                 await MainActor.run { syncText = "正在下载图层数据到本地…" }
                 // syncLayers 已在 refreshConfig 内完成
             }
