@@ -38,7 +38,7 @@ enum TimeUtil {
     }
 
     static func shortSerial(_ s: String) -> String {
-        if let i = s.lastIndex(of: '-') { return String(s[s.index(after: i)...]) }
+        if let i = s.lastIndex(of: "-") { return String(s[s.index(after: i)...]) }
         return s
     }
 
